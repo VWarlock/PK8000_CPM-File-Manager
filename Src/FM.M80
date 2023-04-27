@@ -1,0 +1,2537 @@
+;*****************************************************************************
+;*                                                                           *
+;* CP/M File Manager for PC8000. ver 1.6                                     *
+;* Copyright (C) 2019 Andrey Hlus aka MsDemonId                              *
+;*                                                                           *
+;*****************************************************************************
+
+ASEG
+
+include data.i80
+
+; смещения полей структуры панели
+  PAN_DISK      equ 0
+  PAN_USER      equ 1
+  PAN_LIST      equ 2
+  PAN_WINDOW    equ 4
+
+; бордюры
+  BORDER_RED    equ 0
+  BORDER_GRAY   equ 8
+  BORDER_BLUE   equ 10h
+
+; спецсимволы
+  CHR_SYSFILE   equ 7Fh                 ; ▒
+  CHR_SELECT    equ 1Fh                 ; √
+  CHR_COLON     equ 86h                 ; :
+  CHR_SLASH     equ 87h                 ; \
+  CHR_CURSOR    equ 5Fh                 ; _
+  CHR_COPYFIL   equ BORDER_GRAY+1       ; символ статуса копирования
+
+; 1274
+;  106
+;include vidvar.i80
+
+
+BCtoM macro
+        mov     M, C
+        inx     H
+        mov     M, B
+        inx     H
+endm
+
+DEtoM macro
+        mov     M, E
+        inx     H
+        mov     M, D
+        inx     H
+endm
+
+MtoBC macro
+        mov     C, M
+        inx     H
+        mov     B, M
+        inx     H
+endm
+
+if MOD_CCP
+        ORG 0A980h
+else
+        ORG 100h
+endif
+
+Begin:
+        lxi     H, 0
+        dad     SP
+        shld    OldStack
+        lxi     H, RunStack
+        sphl
+        xra     A
+        call    vid_CopyScr     ; сохраняем экран в буфер
+        call    dsk_GetCount    ; подсчитываем кол. дисков в системе
+        call    ParseCmdLine    ; назначаем панелям диски
+        call    dsk_Reset       ; инициализируем дисковую подсистему
+        call    dsk_DelAuto    ; удаляем файлы '$$$.SUB'
+        call    InitVariables
+        call    kbFlush
+        call    vidInit
+        call    InitScreen
+        call    key_Draw
+
+        mvi     C, 0
+        call    pan_Create
+        mvi     C, 1
+        call    pan_Create
+        ; активизируем панель
+        lda     ActivePanel
+        mov     C, A
+        call    pan_SetActive
+        call    pan_ShowCursor  ; выводим курсор
+        call    cmd_ShowLine    ; выводим ком. строку
+
+        ei
+
+    mainloop:
+        call    pan_GetActive   ; HL - active panel
+        call    pan_GetActiveWnd; BC - окно активной панели
+        call    kbGetFuncKeys
+        dcr     A
+        jz      doHelp          ; F1
+        dcr     A
+        jz      doView          ; F2
+        dcr     A
+        jz      doCopy          ; F3
+        dcr     A
+        jz      doRename        ; F4
+        dcr     A
+        jz      doDelete        ; F5
+        dcr     A
+        jz      doUserLeft      ; Shift+F1
+        dcr     A
+        jz      doUserRight     ; Shift+F2
+        dcr     A
+        jz      doSort          ; Shift+F3
+        dcr     A
+        jz      doAttribute     ; Shift+F4
+        dcr     A
+        jz      mainexit        ; Shift+F5 (F10)
+        dcr     A
+        jz      doChDriveLeft   ; Alf+F1
+        dcr     A
+        jz      doChDriveRight  ; Alf+F2
+        dcr     A
+        dcr     A
+        jz      doMove          ; Alf+F4
+        dcr     A
+        jz      doViewScreen    ; Alf+F4
+
+        ; проверяем состояние Shift
+        lda     0FD85h
+        ani     8+1               ; нажат Алф или РГ?
+        mov     E, A
+        lxi     H, keyFlags
+        xra     M
+        mov     M, E            ; keyFlags = [0FD85h]
+        cnz     key_Draw        ; -> обновляем строку подсказок клавиш F1-F10
+
+        ; проверяем состояние остальных клавиш
+        call    kbIsPressed
+        jz      mainloop
+        call    kbGetKey
+        cpi     8
+        jz      cmd_PutChar     ; -> Back Space
+        cpi     1Bh
+        jz      cmd_PutChar     ; -> ESC
+        cpi     9
+        jz      doSwitchPanel   ; -> TAB, меняем активную панель
+        cpi     1Fh
+        jz      doKeyDown       ; -> курсор вниз
+        jnc     cmd_PutChar     ; -> это печатный символ, выводим его в ком. строку
+        cpi     1Eh
+        jz      doKeyUp         ; -> курсор вверх
+        cpi     19h
+        jz      doKeyPgDn       ; -> курсор на страницу вниз
+        cpi     1Ch
+        jz      doKeyPgDn       ; -> курсор на страницу вниз
+        cpi     0Bh
+        jz      doKeyPgUp       ; -> курсор на страницу вверх
+        cpi     1Dh
+        jz      doKeyPgUp       ; -> курсор на страницу вверх
+        cpi     0Dh
+        jz      doRunFile       ; -> нажат Enter
+        cpi     12h
+        jz      doSelectFile    ; -> выделение (или снятие) файла
+        jmp     mainloop
+
+    mainexit:
+        ; reset video
+        call    vidClear
+        call    chgSetDefault
+        call    vidDone
+        mvi     C, 0            ; завершаем программу
+        call    5
+
+
+
+include util.i80
+include list.i80
+include menu.i80
+include keyb.i80
+include video.i80
+include file.i80
+include view.i80
+
+
+
+; курсор вниз
+doKeyDown:
+        call    lst_CursorDn
+        jmp     mainloop
+; курсор вверх
+doKeyUp:
+        call    lst_CursorUp
+        jmp     mainloop
+; курсор на страницу вниз
+doKeyPgDn:
+        call    lst_CursorPageDn
+        jmp     mainloop
+; курсор на страницу вверх
+doKeyPgUp:
+        call    lst_CursorPageUp
+        jmp     mainloop
+
+; выделение (или снятие) файла
+doSelectFile:
+        push    B
+        push    B
+        call    lst_Select
+        pop     B
+        call    lst_CursorDn
+        ; обновляем информационную строку
+        pop     B
+        call    lst_ShowInfo
+
+        jmp     mainloop
+
+
+
+
+; нажат Enter
+doRunFile:
+        call    KeybCol7
+        ani     40h
+        jnz     @run_placename
+        ; нажат Enter, запускаем на выполнение
+        lda     cmdlCount
+        ora     A
+        jnz     @run_docmdline  ; -> в ком. строке уже есть команда
+        call    @run_pastefn    ; добавляем имя файла под курсором в ком. строку
+        jz      mainloop        ; -> ничего нет под курсором, уходим
+    @run_docmdline:
+        ; передаем модулю CCP ком. строку
+        mov     C, A
+        lhld    CCPInpBuf
+        mov     M, A
+        inx     H
+        xchg
+        lhld    CCPInpPtr       ; корректируем баг CCP с указателем на буфер
+        mov     M, E
+        inx     H
+        mov     M, D
+        push    B
+        push    B
+        ; активизируем диск и user активной панели
+        call    pan_SetDrive
+        ; и собственно ком. строку
+        pop     B
+        lxi     H, cmdlBuff
+        push    H
+        call    memcpy
+        xra     A
+        stax    D
+        ; восстанавливаем видеорежим
+        call    vid_SwitchMode0
+        call    vid_RestScr
+        ; выводим ком строку
+        call    pan_GetActive
+        mov     A, M
+        adi     'A'
+        sta     CURBKGR
+        lhld    CURBADR
+        mov     M, A
+        inx     H
+        mvi     M, '>'
+        inx     H
+        xchg
+        pop     H
+        pop     B
+        call    memcpy
+        ; создаем файл автозапуска ('$$$.SUB')
+        call    MakeAutoRun
+        ; восстанавливаем стек
+        lhld    OldStack
+        sphl
+        ; уходим на CCP
+        lda     CUR_DRIVE
+        mov     C, A
+        lhld    CCPAddr
+        pchl
+
+    @run_placename:
+        call    @run_pastefn    ; добавляем имя файла под курсором в ком. строку
+        call    cmd_ShowLine    ; перерисовываем новую ком. линию
+        jmp     mainloop
+
+    ; ----------------------------------------------------
+    ; добавляет в буфер ком. строки имя файла под курсором
+    ; ----------------------------------------------------
+    ; на выходе:
+    ;   ZF      - 1: ничего не добавили
+    ;   A       - новая длина ком. строки
+    @run_pastefn:
+        call    lst_GetCur      ; HL - имя текущего файла
+        rz
+        xchg
+        lxi     H, cmdlBuff
+        lda     cmdlCount
+        cpi     127
+        rnc
+        mov     C, A
+        mvi     B, 0
+        dad     B
+        xchg                    ; DE = &cmdlBuff[cmdlCount] / HL - cur name
+        push    D
+        ora     A
+        jnz     @run_getfull
+        ; ком. строка пуста, кладем в нее только имя файла
+        call    NCisCOM
+        jnz     @run_psterr
+        call    NC2NAME
+        jmp     @run_pastedone
+    @run_getfull:
+        ; это параметр, кладем полное имя файла
+        call    NC2DOS
+    @run_pastedone:
+        ; корректируем длину ком. строки
+        pop     B               ; BC = &cmdlBuff[cmdlCount]
+        call    strlen
+        mov     C, A
+        lda     cmdlCount
+        add     C
+        sta     cmdlCount
+        ora     A
+        ret
+    @run_psterr:
+        pop     B
+
+        xra     A
+        ret
+
+
+; TAB, меняем активную панель
+doSwitchPanel:
+        ; скрываем курсор
+        call    wndHideCursor
+        ; меняет номер текущей панели
+        call    pan_Swap
+        ; перерисовываем список файлов и информационную строку
+        call    pan_ReDrawList
+        ; выводим курсор
+        call    pan_ShowCursor  ; выводим курсор
+        call    cmd_ShowLine    ; выводим ком. строку
+        jmp     mainloop
+
+
+
+;------------------------------------------------------------------------
+; запуск операций и диалогов
+;------------------------------------------------------------------------
+
+; F1 - диалог справки
+doHelp:
+        ; скрываем курсор и устанавливаем палитру
+        call    wndHideCursor
+        call    key_Disable
+        mvi     A, 22
+        mvi     C, 10
+        lxi     H, palHelp
+        call    vidSetPalette
+        ; выводим окно
+        lxi     H, WndGray+WX
+        mvi     M, 1
+        inx     H
+        mvi     M, 3
+
+
+        lxi     B, MenuHelp
+        call    DoDialog
+        ; восстанавливаем знакогенератор, курсор и палитру
+        call    InitScreen
+        jmp     endFuncs
+
+; F2 - просмотр файла
+doView:
+        call    enterFuncs
+        lxi     B, sOpFile
+        call    file_Size
+        shld    viFileSize
+        ; reset video
+        call    vid_SwitchMode0
+        ; open file
+        lxi     B, sOpFile
+        call    file_Open
+        jc      @view_done
+        call    runView
+        lxi     B, DEF_FCB
+        call    file_Close
+    @view_done:
+;        call    dsk_DefIO       ; восстанавливаем дефолтные DMA и FCB
+        ; восстанавливаем палитру и знакогенератор
+        call    vidClear
+        call    vidInit
+        call    InitScreen
+        ; восстанвливаем экран
+        call    pan_ReDraw
+        call    cmd_ShowLine    ; выводим ком. строку
+        jmp     endFuncs
+
+
+; F3 - диалог копирование файлов
+doCopy:
+        call    enterFFuncs
+        jz      @cpy_onefile
+        ;--------------------------
+        ; копируем группу файлов
+        lxi     B, MenuCpyMulti
+        call    DoDialog
+        jnz     endFuncs        ; -> отказ от копирования
+        call    lst_BeginEnumSel
+    @cpym_loop:
+        call    lst_EnumSel     ; ; выбираем очередной выделенный файл
+        jnc     @cpy_done       ; -> больше нет выделенных файлов
+        ; копируем очередной файл
+        lxi     B, MenuCpyFile
+        call    DoDialog
+        jz      @cpym_ins
+        dcr     A
+        jz      @cpym_error     ; -> системная ошибка, уходим
+        dcr     A
+        jnz     @cpy_done       ; -> [Cancel]
+        ; [Skip]
+        jmp     @cpym_next
+      @cpym_ins:
+        ; файл скопирован, обновляем противоположную панель
+        call    pan_InsPassive
+      @cpym_next:
+        call    pan_DrawActive
+        jmp     @cpym_loop
+
+    @cpym_error:
+        ; системная ошибка; выводим сообщение
+        lxi     B, MenuCpyError
+        call    DoDialog
+        jmp     @cpy_done
+
+        ;----------------------
+        ; копируем один файл
+    @cpy_onefile:
+        lxi     B, MenuCpyOne
+        call    DoDialog
+        jnz     @cpy_done
+        lxi     B, MenuCpyFile
+        call    DoDialog
+        cpi     1
+        jz      @cpym_error
+        ora     A
+        jnz     @cpy_done
+        ; файл скопирован, обновляем противоположную панель
+        call    pan_InsPassive
+    @cpy_done:
+        ; восстанавливаем USER-область
+        call    user_Src        ; set USER (source panel)
+        call    pan_IsEquDsk    ; if (leftDisk == rightDisk)
+        cz      pan_UpdDskInfo  ;     pan_UpdDskInfo()
+
+; завершение работы функций F1-F10
+endFuncs:
+        call    pan_ShowCursor  ; выводим курсор
+        call    dsk_DefIO       ; восстанавливаем дефолтные DMA и FCB
+        call    key_Enable      ; перерисовываем строку подсказок
+        jmp     mainloop
+
+
+; вход в функции F1-F10
+enterFFuncs:
+        xra     A
+        sta     OpFlags
+enterFuncs:
+        call    lst_IsEmpty
+        jnz     @entfn_done
+        pop     H
+        jmp     mainloop
+    @entfn_done:
+        call    wndHideCursor
+        call    key_Disable
+        call    dlg_MakeParams
+        call    dsk_DefIO       ; устанавливаем дефолтные DMA и FCB
+        call    lst_IsSelected
+        mov     A, L
+        sta     nFiles
+        ret
+
+
+; F4 - диалог переименования файла
+doRename:
+        call    enterFuncs
+        lxi     B, MenuRenOne
+        call    DoDialog
+        jnz     endFuncs
+        ; обновляем панель и списки файлов
+        call    pan_RenFile
+        jmp     endFuncs
+
+
+; F5 - диалог удаления файлов
+doDelete:
+        call    enterFFuncs
+        jz      @del_onefile
+        ;----------------------
+        ; удаляем группу файлов
+        lxi     B, MenuDelMulti
+        call    DoDialog
+        jnz     @del_done       ; -> отказ от удаления
+        call    lst_BeginEnumSel
+    @delm_loop:
+        call    lst_EnumSel     ; ; выбираем очередной выделенный файл
+        jnc     @del_done       ; -> больше нет выделенных файлов
+        lda     OpFlags
+        ani     OP_DEL_ALL
+        jnz     @delm_delete
+        ; запрашиваем удаление очередного файла
+        lxi     B, MenuDelReqOne
+        call    DoDialog
+        jz      @delm_delete    ; -> [Del]
+        dcr     A
+        jz      @delm_stall     ; -> [All]
+        dcr     A
+        jnz     @del_done       ; -> [Cancel]
+      @delm_skip:               ;    [Skip]
+        jmp     @delm_next
+      @delm_stall:
+        lda     OpFlags
+        ori     OP_DEL_ALL
+        sta     OpFlags
+      @delm_delete:
+        ; удаляем очередной файл
+        lxi     B, MenuDelFile
+        call    DoDialog
+        cpi     3
+        jz      @del_done       ; -> [Cancel]
+        ora     A
+        jnz     @delm_skip      ; -> [Skip]
+        ; файл удален
+        lhld    Lst$CurSel
+        call    lst_Remove      ; удаляем из списка файл
+        call    pan_DelPassive  ; удаляем из списка противоположной панели
+      @delm_next:
+        call    lst_IsSelected
+        cnz     pan_DrawActive
+        jmp     @delm_loop
+
+        ;------------------
+        ; удаляем один файл
+    @del_onefile:
+        lxi     B, MenuDelOne
+        call    DoDialog
+        jnz     @del_done
+        lxi     B, MenuDelFile
+        call    DoDialog
+        jnz     @del_done
+        ; файл удален
+        call    lst_RemoveCur   ; удаляем из списка файл под курсором
+        call    pan_DelPassive  ; удаляем из списка противоположной панели
+    @del_done:
+        call    lst_SetDiskFree ; пересчитываем размер диска
+        call    pan_DrawActive
+        jmp     endFuncs
+
+
+
+doUserLeft:
+        ; диалог выбора диска для левой панели
+        xra     A
+        jmp     doChgUser
+doUserRight:
+        ; диалог выбора диска для правой панели
+        mvi     A, 1
+  doChgUser:
+        call    enterChange
+        inx     H
+        push    H
+        push    B
+        ; устанавливаем курсор (по номеру текущего USER)
+        mov     A, M
+        ani     0Fh
+        sta     MnuChgCur
+        ; переходим на выбор диска
+        lxi     B, MenuUsrChg
+        call    DoDialog
+        ; обновляем панель
+        jmp     endChange
+
+
+
+; Shift+F3 - диалог выбора типа сортировки файлов в панели
+doSort:
+        lda     ActivePanel
+        call    enterChange
+        push    B
+        lda     lst$Sort
+        ani     1
+        sta     MnuChgCur
+
+        ; переходим на выбор типа сортиртировки
+        lxi     B, MenuSortChg
+        call    DoDialog
+        pop     B
+        cpi     0FFh
+        jz      endFuncs        ; -> отмена операции, уходим
+        ani     1
+        sta     lst$Sort
+        call    pan_Create
+        call    cmd_ShowLine    ; выводим ком. строку
+        jmp     endFuncs
+
+
+
+; Shift+F4 - диалог установки атрибутов файлов
+doAttribute:
+        ; настраиваем знакогенератор
+        push    B
+        lxi     B, ChkBoxNo
+        mvi     E, 0CAh
+        call    chgSetChar
+        inr     E
+        call    chgSetChar
+        mvi     C, ' '
+        mvi     E, 0C9h
+        call    chgCopyChar
+        ; выполняем вход в функцию
+        pop     B
+        call    enterFuncs
+        jz      @atr_onefile
+        ; установка атрибутов для группы файлов
+        xra     A
+        sta     attrCurrent
+        lxi     B, MenuAtrMulti
+        call    DoDialog
+        cpi     0FFh
+        jz      @atr_runexit
+        sta     attrCurrent
+        call    lst_BeginEnumSel
+    @atr_loop:
+        call    lst_EnumSel     ; ; выбираем очередной выделенный файл
+        jnc     @atr_runexit    ; -> больше нет выделенных файлов
+        lxi     B, MenuAtrInfo
+        call    DoDialog
+        lhld    Lst$CurSel
+        call    pan_Attrib
+        jmp     @atr_loop
+
+    @atr_onefile:
+        lxi     B, sOpFile
+        call    GetAtr
+        sta     attrCurrent
+        ; установка атрибутов для одного файла
+        lxi     B, MenuAtrOne
+        call    DoDialog
+        cpi     0FFh
+        jz      @atr_runexit    ; -> отмена операции или ошибка
+        mov     E, A
+        lda     attrCurrent
+        cmp     E
+        jz      @atr_runexit    ; -> атрибут не изменился
+        ; готовим параметры для установки
+        mov     A, E
+        sta     attrCurrent     ; новые атрибуты
+        lxi     B, MenuAtrInfo
+        call    DoDialog
+        ; обновляем список в панели
+        call    lst_GetCur
+        call    pan_Attrib
+    @atr_runexit:
+        jmp     endFuncs
+
+
+; пока не поддерживается
+doUnsupport:
+        jmp     mainloop
+
+
+
+; Alf+F1 - диалог выбора диска для левой панели
+doChDriveLeft:
+        xra     A
+        jmp     doChgDrive
+; Alf+F2 - диалог выбора диска для правой панели
+doChDriveRight:
+        mvi     A, 1
+  doChgDrive:
+        call    enterChange
+        push    H
+        push    B
+        ; устанавливаем курсор
+        mov     A, M
+        sta     MnuChgCur
+        ; переходим на выбор диска
+        lxi     B, MenuDskChg
+        call    DoDialog
+        ; обновляем панель
+  endChange:
+        pop     B               ; C - номер панели
+        pop     H               ; HL - указатель на Disk или User панели
+        cpi     0FFh
+        jz      endFuncs        ; -> отмена операции, уходим
+        ani     0Fh
+        mov     M, A
+        call    pan_Create
+        call    cmd_ShowLine    ; выводим ком. строку
+        jmp     endFuncs
+
+
+; на входе:
+;       A       - номер панели, где будет выводиться окно диалога
+; на выходе:
+;       HideCursor()
+;       KeyDisable()
+;       WndDskChg.x
+;       HL      - указатель на структуру заданной панели
+enterChange:
+        mov     C, A
+        push    B
+        call    pan_GetWnd      ; BC - Window of panel
+        lxi     H, WX
+        dad     B
+        mov     A, M
+        adi     2
+        sta     WndGray+WX
+        mvi     A, 2
+        sta     WndGray+WY
+        call    pan_GetActiveWnd; BC - окно активной панели
+        call    wndHideCursor
+        call    key_Disable
+        pop     B
+        call    pan_GetPanel    ; return HL = active panel
+        ret
+
+
+; Alf+F4 - перемещение файлов
+doMove:
+        call    enterFFuncs
+        jz      @mov_onefile
+        ;--------------------------
+        ; перемещаем группу файлов
+        lxi     B, MenuMovMulti
+        call    DoDialog
+        jnz     endFuncs        ; -> отказ от перемещения
+        call    lst_BeginEnumSel
+    @movm_loop:
+        call    lst_EnumSel     ; ; выбираем очередной выделенный файл
+        jnc     @mov_done       ; -> больше нет выделенных файлов
+        ; копируем очередной файл
+        lxi     B, MenuMovFile
+        call    DoDialog
+        jz      @movm_ins
+        dcr     A
+        jz      @movm_error     ; -> системная ошибка, уходим
+        dcr     A
+        jnz     @mov_done       ; -> [Cancel]
+        ; [Skip]
+        jmp     @movm_next
+      @movm_ins:
+        ; файл перемещен, обновляем панели
+        lhld    Lst$CurSel
+        call    lst_Remove      ; удаляем из списка файл
+        call    pan_InsPassive
+      @movm_next:
+        call    lst_IsSelected
+        cnz     pan_DrawActive
+        jmp     @movm_loop
+
+    @movm_error:
+        ; системная ошибка; выводим сообщение
+        lxi     B, MenuMovError
+        call    DoDialog
+        jmp     @mov_done
+
+        ;----------------------
+        ; перемещаем один файл
+    @mov_onefile:
+        lxi     B, MenuMovOne
+        call    DoDialog
+        jnz     endFuncs        ; -> отказ от перемещения
+        lxi     B, MenuMovFile
+        call    DoDialog
+        cpi     1
+        jz      @movm_error
+        ora     A
+        jnz     @mov_done
+        ; файл перемещен, обновляем панели
+        call    lst_RemoveCur   ; удаляем из списка файл под курсором
+        call    pan_InsPassive
+    @mov_done:
+        ; восстанавливаем USER-область
+        call    user_Src        ; set USER (source panel)
+        call    pan_DrawActive
+        call    pan_UpdDskInfo  ;     pan_UpdDskInfo()
+        jmp     endFuncs
+
+
+
+; Alf+F5 - просмотр экрана "под" панелями
+doViewScreen:
+        call    vid_SwitchMode0
+        call    vid_RestScr
+        call    doAnyKey
+        jmp     @view_done      ; -> востанавливаем экран и уходим
+
+
+vid_SwitchMode0:
+        call    vidClear
+        call    chgSetDefault
+        call    vidDone
+        ret
+
+vid_RestScr:
+        ori     -1
+;------------------------------------------------------------------------
+; копирование буфер<->экран (только для видеорежима 0)
+;------------------------------------------------------------------------
+; на входе:
+;       A       - 0: копируем с экрана в буфер
+;                 1: копируем из буфера на экран
+vid_CopyScr:
+        lxi     B, 0600h        ; 6*256 = 64*24 = 1536
+        lhld    BUFSCR
+        lxi     D, scrSystem
+        ora     A
+        jz      @vscr_loop
+        xchg
+    @vscr_loop:
+        call    memcpy
+        dcr     B
+        jnz     @vscr_loop
+        ret
+
+
+
+
+
+;------------------------------------------------------------------------
+; формирует параметры для диалогов
+;------------------------------------------------------------------------
+; на выходе:
+;       sOpFile - полное имя файла в формате CP/M ('A:FILE    EXT')
+;       sDstFile- полное имя файла в противоположной панели ('B:FILE    EXT')
+dlg_MakeParams:
+        call    lst_GetCur
+dlg_MakeOpParam:
+        push    H
+        ; формируем имя дисковода активной панели
+        call    pan_GetActive   ; HL - структура активной панели
+        lxi     D, sSrcPath
+        call    pan_GetPath
+        lxi     D, sOpFile
+        call    pan_GetDrive
+        ; user - область
+        inx     H
+        mov     A, M
+        sta     cpyUserSrc    ; номер USER-области исходных файлов
+        ; добавляем имя файла под курсором
+        pop     H
+        call    NC2CPM
+        ; формируем имя файла противоположной панели (для оп. копирования)
+        call    pan_GetPassive  ; HL - структура активной панели
+        lxi     D, sDstPath
+        call    pan_GetPath
+        lxi     D, sDstFile
+        call    pan_GetDrive
+        ; user-область
+        inx     H
+        mov     A, M
+        sta     cpyUserDst   ; номер USER-области наначения
+        lxi     H, sOpFile+2
+        mvi     C, 8+3
+        jmp     memcpy
+
+
+;------------------------------------------------------------------------
+; выводим символ в ком. строку
+;------------------------------------------------------------------------
+cmd_PutChar:
+        cpi     1Bh
+        jz      @putc_esc
+        cpi     8
+        jz      @putc_bkcpc
+        cpi     80h
+        jnc     mainloop
+        ; проверяем необходимость перевода в верхний регистр
+        cpi     'a'
+        jc      @putc_chk
+        cpi     'z'+1
+        jnc     @putc_chk
+        ani     5Fh
+    @putc_chk:
+        mov     C, A            ; C - symbol
+        lda     cmdlCount
+        cpi     127             ; макс. длина ком. строки
+        jnc     mainloop
+        mov     E, A
+        mvi     D, 0
+        lxi     H, cmdlBuff
+        dad     D
+        mov     M, C            ; cmdlBuff[cmdlCount] = symbol
+        inr     A
+    @putc_show:
+        sta     cmdlCount       ; cmdlCount++
+        call    cmd_ShowLine    ; выводим ком. строку
+        jmp     mainloop
+
+    @putc_esc:
+        xra     A
+        jmp     @putc_show
+
+    @putc_bkcpc:
+        lda     cmdlCount
+        ora     A
+        jz      mainloop
+        dcr     A
+        jmp     @putc_show
+
+
+;------------------------------------------------------------------------
+; выводит ком. строку из буфера на экран
+;------------------------------------------------------------------------
+cmd_ShowLine:
+        ; выводим имя диска
+        lhld    cmddVAddr
+        xchg
+        call    pan_GetActive   ; HL - структура активной панели
+        call    pan_GetPath     ; C = len path
+        xchg
+        shld    cmdlVAddr
+        dcx     H
+        mvi     M, '>'
+        mvi     A, 31;+1
+        sub     C
+        ;sta     cmdlWidth       ; cmdlWidth = SCR_WIDTH - length(PATH)
+        mov     D, A
+
+        ; выводим саму ком. строку
+        lda     cmdlCount
+        cmp     D
+        jc      @cmd_nofull
+        ; длина ком. строки больше или равна ширине экрана
+        sub     D               ; D = len       = cmdlWidth
+                                ; A = first     = cmdlCount - cmdlWidth
+        mvi     E, 0            ; E = cmdlSpace = 0
+        jmp     @cmd_copycmd
+    @cmd_nofull:
+        ; длина ком. строки меньше ширины экрана
+        mov     E, D
+        mov     D, A            ; D = len       = cmdlCount
+        mov     A, E
+        sub     D
+        mov     E, A            ; E = cmdlSpace = cmdlWidth - cmdlCount
+        xra     A               ; A = first     = 0
+    @cmd_copycmd:
+        ; копирование из буфера в ком. строку
+        ; A - first
+        ; E - cmdlSpace (остаток заполняемой пробелами строки экрана)
+        ; D - len
+        push    D               ; save E
+        mov     C, A
+        mvi     B, 0
+        lxi     H, cmdlBuff
+        dad     B               ; HL = &cmdlBuff[first]
+        mov     C, D            ; BC = len
+        xchg
+        lhld    cmdlVAddr
+        xchg
+        mov     A, C
+        ora     A
+        cnz     memcpy
+        xchg
+        ; выводим курсор
+        mvi     M, CHR_CURSOR           ; cursor
+        inx     H
+        ; и забиваем остаток строки пробелами
+        pop     B
+        mov     A, C
+        ora     A
+        mvi     A, ' '
+        cnz     memset
+        ret
+
+
+;------------------------------------------------------------------------
+; выводит курсор в текущую панель
+;------------------------------------------------------------------------
+pan_ShowCursor:
+        call    pan_GetActiveWnd; BC - окно активной панели
+        lda     Lst$PosY
+        mov     E, A
+        jmp     wndShowCursor
+
+
+;------------------------------------------------------------------------
+; выводит на экран окно панели
+;------------------------------------------------------------------------
+; на входе:
+;       BC      - указатель на структуру панели
+; на выходе:
+;       HL      - указатель на структуру панели
+pan_ShowWindow:
+        push    B
+        call    pan_WndName     ; задаем имя окна
+        ; выводим само окно
+        call    wndShow
+        call    wndDrawSplit
+        pop     H
+        ret
+
+; на входе:
+;       BC      - &Panel
+; на выходе:
+;       BC      - &Window
+pan_WndName:
+        lxi     H, PAN_WINDOW
+        dad     B
+        mov     E, M
+        inx     H
+        mov     D, M
+        xchg
+        push    H               ; save &Window
+        mvi     M, 3            ; ставим дефолтную длину имени окна
+        ldax    B
+        inx     B
+        push    B               ; save &pan.user
+        adi     'A'
+        mov     C, A
+        inx     H               ; HL = &Wnd.Name[0]
+        mov     E, M
+        dcx     H               ; HL = &Wnd.lenName
+        call    chgSetInvChar
+        pop     B
+        ldax    B               ; A - user
+        ora     A
+        jz      @pan_wnmdone
+        cpi     10
+        jc      @pan_wnmrem
+        push    PSW
+        mvi     C, '1'
+        inr     E
+        call    chgSetInvChar
+        inr     M
+        pop     PSW
+        sui     10
+    @pan_wnmrem:
+        adi     '0'
+        mov     C, A
+        inr     E
+        call    chgSetInvChar
+        inr     M
+    @pan_wnmdone:
+        pop     B               ; return &Window
+        ret
+
+
+
+
+;------------------------------------------------------------------------
+; создание списка файлов и отображение окна панели
+;------------------------------------------------------------------------
+; на входе:
+;       C       - номер панели
+;       shFMask - маска отображения файлов в формате CP/M (типа: "????????STC")
+pan_Create:
+        lda     ActivePanel
+        push    PSW             ; save active panel
+        call    pan_SetActive
+        call    lst_SetDiskFree ; пересчитываем размер диска
+        call    pan_GetActive
+        mov     C, L
+        mov     B, H            ; BC - Panels[C]
+        call    pan_ShowWindow
+;        call    lst_GetFreeRec
+        call    lst_MakeFileList; заполняем список панели именами файлов
+;        call    lst_GetFreeRec
+
+        ; выводим текущий список файлов в окно
+        call    pan_DrawActive
+        pop     PSW             ; restore active pan
+        mov     C, A
+        jmp     pan_SetActive
+
+
+
+
+
+;------------------------------------------------------------------------
+; полная перерисовка обоих окон
+;------------------------------------------------------------------------
+pan_ReDraw:
+        call    pan_Swap
+        call    @redrawact
+        call    pan_Swap
+    @redrawact:
+        call    pan_GetActive
+        mov     C, L
+        mov     B, H            ; BC - Panels[C]
+        call    pan_ShowWindow
+        ; выводим текущий список файлов в окно
+        jmp     pan_DrawActive
+
+
+
+
+
+;------------------------------------------------------------------------
+; активизация панели
+;------------------------------------------------------------------------
+; на входе:
+;       C       - номер панели (0 - левая, 1 - правая)
+; на выходе:
+;       BC      - связанное с панелью окно
+;       - установлен текущий диск
+;       - активизирован список
+pan_SetActive:
+        mov     A, C
+        cpi     2
+        rnc                     ; -> num panel too big!
+        sta     ActivePanel
+        ; активизируем диск активной панели
+        call    pan_SetDrive
+        ; устанавливаем user-область
+        inx     H               ; HL = &pan.UserNo
+        mov     A, M
+        call    dsk_SetUser
+        ; активизируем привязанный к панели список
+        inx     H               ; HL = &pan.List
+        mov     C, M
+        inx     H
+        mov     B, M            ; BC - список панели
+        inx     H
+        call    lst_Activate
+        mov     C, M
+        inx     H
+        mov     B, M            ; BC - окно панели
+        ret
+
+
+;------------------------------------------------------------------------
+; активизирует диск активной панели
+;------------------------------------------------------------------------
+; на выходе:
+;       HL      - указатель на структуру активной панели
+pan_SetDrive:
+        call    pan_GetActive   ; HL - active panel
+        mov     A, M
+        jmp     dsk_SetActive
+
+
+;------------------------------------------------------------------------
+; активизирует противоположную панель
+;------------------------------------------------------------------------
+; на выходе:
+;       BC      - связанное с панелью окно
+;       - установлен текущий диск
+;       - активизирован список
+pan_Swap:
+        lda     ActivePanel
+        xri     1
+        mov     C, A
+        jmp     pan_SetActive
+
+
+;------------------------------------------------------------------------
+;
+;------------------------------------------------------------------------
+; на входе:
+;       C       - номер панели (0 - левая, 1 - правая)
+; на выходе:
+;       HL      - указатель на структуру панели
+pan_GetPanel:
+        lxi     H, LeftPanel
+        mov     A, C
+        ora     A
+        rz
+        lxi     H, RightPanel
+        ret
+
+;------------------------------------------------------------------------
+; возвращает указатель на активную панель
+;------------------------------------------------------------------------
+; на выходе:
+;       HL      - указатель на структуру активной панели
+pan_GetActive:
+        lda     ActivePanel
+        mov     C, A
+        jmp     pan_GetPanel
+
+;------------------------------------------------------------------------
+; возвращает указатель на пассивную панель
+;------------------------------------------------------------------------
+; на выходе:
+;       HL      - указатель на структуру пассивной панели
+pan_GetPassive:
+        lda     ActivePanel
+        xri     1
+        mov     C, A
+        jmp     pan_GetPanel
+
+
+;------------------------------------------------------------------------
+; возвращает указатель на окно активной панели
+;------------------------------------------------------------------------
+; на входе:
+;       C       - номер панели (0 - левая, 1 - правая)
+; на выходе:
+;       BC      - указатель на окно
+pan_GetWnd:
+        push    H
+        call    pan_GetPanel
+        jmp     @pan_getwindow
+;------------------------------------------------------------------------
+; возвращает указатель на окно активной панели
+;------------------------------------------------------------------------
+; на выходе:
+;       BC      - указатель на окно
+pan_GetActiveWnd:
+        push    H
+        call    pan_GetActive
+    @pan_getwindow:
+        lxi     B, PAN_WINDOW
+        dad     B
+        mov     C, M
+        inx     H
+        mov     B, M
+        pop     H
+        ret
+
+
+
+;------------------------------------------------------------------------
+; формирует имя диска панели в буфер
+;------------------------------------------------------------------------
+; на входе:
+;       HL      - указатель на панель
+;       DE      - буфер под имя диска ('A:')
+; destroy: A
+pan_GetDrive:
+        mov     A, M
+        adi     'A'
+        stax    D
+        inx     D
+        mvi     A, ':'
+        stax    D
+        inx     D
+        ret
+
+;------------------------------------------------------------------------
+; формирует имя диска панели и "путь" (номер юзер-области) в буфер
+;------------------------------------------------------------------------
+; на входе:
+;       HL      - указатель на панель
+;       DE      - буфер под имя диска ('A:')
+; на выходе:
+;       DE      - конец буфера (на завершающий ноль)
+;        C      - длина стоки
+pan_GetPath:
+        call    pan_GetDrive
+        inx     H
+        xchg                    ; HL - буфер / DE - указатель на юзер-область
+        mvi     M, '\'
+        inx     H
+        mvi     C, 3
+        ldax    D
+        dcx     D
+        ora     A
+        jz      @pan_gdrvdone   ; -> нулевая юзер-область
+        cpi     10
+        jc      @pan_gdrvmod
+        mvi     M, '1'
+        inx     H
+        sui     10
+        inr     C
+    @pan_gdrvmod:
+        adi     '0'
+        mov     M, A
+        inx     H
+        mvi     M, '\'
+        inx     H
+        inr     C
+        inr     C
+    @pan_gdrvdone:
+        mvi     M, 0            ; ставим завершающий ноль
+        xchg
+        ret
+
+
+;------------------------------------------------------------------------
+; перерисовывает список файлов в активной панели, без курсора
+;------------------------------------------------------------------------
+; на входе:
+;       ActivePanel - активная панель
+pan_DrawActive:
+        call    pan_GetActiveWnd
+pan_ReDrawList:
+        call    lst_Show        ; и обновляем панель
+        jmp     lst_ShowInfo
+
+
+;------------------------------------------------------------------------
+; обновляет размер текущего диска
+;------------------------------------------------------------------------
+; на входе:
+;       ActivePanel - активная панель
+pan_UpdDskInfo:
+        call    lst_SetDiskFree
+        call    pan_GetActiveWnd
+        jmp     lst_ShowInfo
+
+;------------------------------------------------------------------------
+; проверяет, не одинаковые ли панели (диски + user-области)
+;------------------------------------------------------------------------
+; на выходе:
+;       ZF      - 1: одинаковы
+;                 0: разные
+; destroy: C
+pan_IsEqual:
+        ; сравниваем user-области
+        lda     LeftPanel+PAN_USER
+        mov     C, A
+        lda     RightPanel+PAN_USER
+        cmp     C
+        rnz
+;------------------------------------------------------------------------
+; проверяет, не одинаковые ли диски в обоих панелях
+;------------------------------------------------------------------------
+; на выходе:
+;       ZF      - 1: одинаковы
+;                 0: разные
+; destroy: C
+pan_IsEquDsk:
+        lda     LeftPanel
+        mov     C, A
+        lda     RightPanel
+        cmp     C
+        ret
+
+;------------------------------------------------------------------------
+; добавляет файл в список пассивной панели
+;------------------------------------------------------------------------
+; на входе:
+;       ActivePanel - активная панель
+;       sOpFile     - полное имя добавляемого файла
+pan_InsPassive:
+        call    pan_Swap
+        push    B
+        ; конвертируем имя в формат списка (NC)
+        lxi     H, sOpFile+1
+        lxi     D, sBufCnv
+        call    CPM2NC
+        ; ищем в списке и удаляем его
+        lxi     B, sBufCnv
+        call    lst_Searsh
+        cnz     lst_Remove
+        ; добавляем в список
+        lxi     B, sBufCnv
+        mvi     E, 0
+        call    lst_Insert
+        call    lst_SetDiskFree ; пересчитываем размер диска
+pan_Rest:
+        pop     B
+        call    pan_ReDrawList
+        jmp     pan_Swap
+
+
+
+;------------------------------------------------------------------------
+; удаляет файл из списка противоположной панели
+;------------------------------------------------------------------------
+; на входе:
+;       ActivePanel - активная панель
+;       sOpFile     - полное имя удаляемого файла
+pan_DelPassive:
+        call    pan_IsEqual
+        jnz     @pan_delChkInfo ; -> панели разные
+        ; панели одинаковы, удаляем файл из списка пассивоной панели
+        call    pan_Swap
+        push    B
+        ; конвертируем имя в формат списка (NC)
+        lxi     H, sOpFile+1
+        lxi     D, sBufCnv
+        call    CPM2NC
+        ; ищем в списке и удаляем его
+        lxi     B, sBufCnv
+        call    lst_Searsh
+        cnz     lst_Remove
+  @pan_delinfo:
+        call    lst_SetDiskFree ; пересчитываем размер диска
+        jmp     pan_Rest
+
+  @pan_delChkInfo:
+        call    pan_IsEquDsk
+        rnz                     ; -> панели разные, нечего корректировать
+        call    pan_Swap
+        push    B
+        jmp     @pan_delinfo
+
+
+;------------------------------------------------------------------------
+; переименовывает файл
+;------------------------------------------------------------------------
+pan_RenFile:
+        call    lst_GetCur      ; HL - указатель на запись
+        rz
+        ; готовим имя исходного файла
+        lxi     D, renOldName
+        mvi     C, LST$DATA
+        call    memcpy          ; renOldName = lst_GetCur
+        lxi     H, sDstFile+1
+        lxi     D, renNewName
+        call    CPM2NC
+        ; меняем в активной панели
+        call    @pan_renSwp
+
+        call    pan_IsEqual
+        jnz     @pan_renIsDsk
+        ; корректируем вторую панель
+        call    pan_Swap
+        call    @pan_renSwp
+        call    pan_Swap
+        ret
+    @pan_renIsDsk:
+        call    pan_IsEquDsk
+        rnz
+        ; совпадают только диски, корректруем инфу о диске
+        call    pan_Swap
+        call    pan_UpdDskInfo
+        jmp     pan_Swap
+
+  @pan_renSwp:
+        ; ищем новый элемент
+        lxi     B, renNewName
+        call    lst_Searsh
+        cnz     lst_Remove      ; если нашли, то удаляем найденный элемент
+        ; ищем старый элемент
+        lxi     B, renOldName
+        call    lst_Searsh
+        cnz     lst_Remove      ; если нашли, то удаляем найденный элемент
+
+        ; переименовываем его
+        lxi     B, renNewName
+        call    lst_Insert
+
+        lxi     B, renNewName
+        call    lst_Searsh
+        rz
+        push    H
+
+        ; корректируем атрибуты
+        lxi     B, sDstFile
+        call    GetAtr
+        pop     H
+        call    lst_SetAttrib
+        ; перерисовываем
+        call    lst_SetDiskFree ; пересчитываем размер диска
+        call    pan_DrawActive
+        ret
+
+
+
+
+;------------------------------------------------------------------------
+; установка атрибута файла в панели
+;------------------------------------------------------------------------
+; на входе:
+;       HL      - указатель на элемент списка панели
+;       attrCurrent - новый атрибут
+pan_Attrib:
+        push    H
+        ; задаем атрибут в активной панели
+        lda     attrCurrent
+        call    lst_SetAttrib
+        call    pan_DrawActive
+        pop     H
+        ; и в противоположной
+        call    pan_IsEqual
+        rnz                     ; -> диски в панелях разные, нечего корректировать
+        push    H
+        call    pan_Swap
+        pop     B
+        call    lst_Searsh
+        jz      pan_Swap;@pan_attrdone
+        lda     attrCurrent
+        call    lst_SetAttrib
+        call    pan_DrawActive
+;  @pan_attrdone:
+        jmp     pan_Swap
+
+
+;=============================================================================
+;░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+;░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+;░░░░░░░░░░░░ функции окон диалогов (копирование, удаление и тд.) ░░░░░░░░░░░░
+;░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+;░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+;=============================================================================
+
+;------------------------------------------------------------------------
+; функция окна смены диска
+;------------------------------------------------------------------------
+; на входе:
+;       MnuChgCur - номер текущего пункта меню (поз. курсора в окне)
+;       WndGray   - окно
+; на выходе:
+;       A         - выбранная строка меню под курсором или 0xFF (выбор отменен)
+runChange:
+        lxi     B, WndGray      ; BC - window
+        lda     MnuChgCur
+        mov     E, A            ; E - текущий диск (0 - 'A', 1 - 'B', etc...)
+        call    wndGetHeight
+        sta     MnuChgMax
+        dcr     A
+        cmp     E
+        jnc     @@dskchgrun
+        mov     E, A
+
+    @@dskchgrun:
+        call    @@dskchg_showcur
+    @@dskchglp:
+        ; BC - window
+        call    kbGetKey
+        ora     A
+        jz      @@dskchglp
+        cpi     1Bh             ; ESC?
+        jz      @@dskchg_cancel
+        cpi     1Fh             ; курсор вниз?
+        jz      @@dskchg_dn
+        cpi     1Eh             ; курсор вверх?
+        jz      @@dskchg_up
+        cpi     0Dh             ; нажат Enter?
+        jnz     @@dskchglp
+        ; enter
+    @@dskcgh_exit:
+        call    wndHideCursor
+        lda     MnuChgCur
+        ret
+    @@dskchg_cancel:
+        mvi     A, 0FFh
+        sta     MnuChgCur
+        ret
+
+    @@dskchg_dn:
+        call    wndHideCursor
+        lda     MnuChgCur
+        inr     A
+        mov     E, A            ; E = cursor + 1
+        lda     MnuChgMax
+        cmp     E
+        jnz     @@dskchg_sd
+        mvi     E, 0
+      @@dskchg_sd:
+        mov     A, E
+        sta     MnuChgCur
+        call    @@dskchg_showcur
+        jmp     @@dskchglp
+
+    @@dskchg_up:
+        call    wndHideCursor
+        lda     MnuChgCur
+        dcr     A               ; cursor--
+        jp      @@dskchg_su
+        lda     MnuChgMax
+        dcr     A
+      @@dskchg_su:
+        sta     MnuChgCur
+        mov     E, A
+        call    @@dskchg_showcur
+        jmp     @@dskchglp
+
+    @@dskchg_showcur:
+        push    B
+        call    wndShowCursor
+        pop     B
+        ret
+
+
+;------------------------------------------------------------------------
+; копирование одиночного файла
+;------------------------------------------------------------------------
+; на входе:
+;       sOpFile - полное имя файла исходного файла
+;       sDstFile- полное имя файла назначения
+;       OpFlags - флаг выполнения операций
+; на выходе:
+;       A       - 0: файл скопирован
+;                 1: системная ошибка удаления файла
+;                 2: файл пропущен (Skip)
+;                 3: отмена операции копирования (Cancel)
+runCpyFile:
+        lxi     H, MenuCpyFExist
+        lxi     D, MenuCpyRO    ; делаем запрос на дальнейшие действия
+        call    checkDestFile
+        ora     A
+        rnz
+        ; копируем файл
+        call    CopyFile
+        ret
+
+;------------------------------------------------------------------------
+; непосредственно удаление одного файла
+;------------------------------------------------------------------------
+; на входе:
+;       sOpFile - полное имя файла
+;       OpFlags - флаг выполнения операций
+; на выходе:
+;       A       - 0: файл удален
+;                 1: системная ошибка удаления файла
+;                 2: файл пропущен (Skip)
+;                 3: отмена операции удаления (Cancel)
+runDelFile:
+        lxi     B, sOpFile
+        call    GetAtr
+        ani     FATTR_RW_BIT
+        jz      @dinf_delete    ; -> удаляем файл
+        ; файл только для чтения
+        lda     OpFlags
+        ani     OP_DEL_RO
+        jnz     @dinf_delete    ; -> удаляем файл
+        ; запрашиваем разрешения на удаление
+        lxi     B, MenuDelRO
+        call    DoDialog
+        jz      @dinf_delete    ; -> удаляем файл
+        cpi     1
+        rnz                     ; -> Skip или Cancel
+        ; выставляем флаг для последующих файлов
+        lda     OpFlags
+        ori     (OP_DEL_RO or OP_DEL_ALL)
+        sta     OpFlags
+    @dinf_delete:
+        ; удаляем файл
+        lxi     B, sOpFile
+        call    file_Delete
+        mvi     A, 1            ; 1 - файл не удалён
+        rc
+        xra     A               ; 0 - файл удалён
+        ret
+
+
+;------------------------------------------------------------------------
+; переименования файла
+;------------------------------------------------------------------------
+; на выходе:
+;       A       -  0: файл переименован
+;                 FF: отмена операции или ошибка
+runRenOne:
+        ; инициализируем "кнопки" диалога
+        call    btnInitialize
+        jz      @ren_reterror
+        call    btnDraw
+        xra     A
+        sta     nRenCnt         ; кол. введенных символов
+        lxi     B, WndGray
+        lxi     D, 0404h
+        call    wndGetOffs
+        shld    renVidAdr       ; текущий адрес видеопамяти
+        shld    renVidOrg       ; адрес видеопамяти
+        ; очищаем строку ввода
+        push    H
+        dcx     H
+        mvi     C, 14
+        mvi     A, ' '
+        call    memset
+        pop     H
+        mvi     M, CHR_CURSOR   ; cursor
+        ; ожидаем ввод строки
+    @ren_getkey:
+        call    kbGetKey
+        lhld    renVidAdr
+        cpi     21h
+        jnc     @ren_putchar
+        cpi     8
+        jz      @ren_bkspc
+        call    btnDoKey        ; управление курсорм кнопок?
+        jnc     @ren_done
+        jmp     @ren_getkey
+    @ren_bkspc:
+        lda     nRenCnt
+        ora     A
+        jz      @ren_getkey
+        mvi     M, ' '
+        dcx     H
+        mvi     M, CHR_CURSOR   ; cursor
+        shld    renVidAdr
+        dcr     A
+        sta     nRenCnt
+        jmp     @ren_getkey
+    @ren_putchar:
+        mov     C, A
+        lda     nRenCnt
+        cpi     12
+        jnc     @ren_getkey
+        mov     M, C
+        inx     H
+        mvi     M, CHR_CURSOR   ; cursor
+        shld    renVidAdr
+        inr     A
+        sta     nRenCnt
+        jmp     @ren_getkey
+
+        ; уточняем что именно нажато
+    @ren_done:
+        ora     A
+        rnz                     ; -> отмена операции
+        ; начинаем переименование файла
+        lda     nRenCnt
+        ora     A
+        jz      @ren_reterror
+        ; создаем новое имя файла в формате CP/M
+        lda     sOpFile
+        sta     sDstFile        ; имя диска - текущее
+        lhld    renVidOrg
+        mov     C, L
+        mov     B, H
+        lxi     D, sDstFile+2
+        call    DOS2CP
+        ; проверяем наличие такого файла на диске
+        lxi     B, sDstFile
+        call    file_FindFirst
+        mov     A, L
+        ora     H
+        jz      @ren_proceed
+        ; файл существует, запрашиваем перезапись
+        lxi     B, MenuRenFExist
+        call    DoDialog
+        rnz
+        ; проверяем атрибуты файла
+        lxi     B, sDstFile
+        call    GetAtr
+        ani     FATTR_RW_BIT
+        jz      @ren_deldest
+        ; файл имеет атрибут только для чтения, делаем запрос
+        lxi     B, MenuRenRO
+        call    DoDialog
+        rnz
+    @ren_deldest:
+        lxi     B, sDstFile
+        call    file_Delete
+        jc      @ren_reterror   ; -> что-то пошло не так
+
+        lxi     B, sDstFile
+        call    file_FindFirst
+        mov     A, L
+        ora     H
+        jnz     @ren_reterror   ; -> что-то пошло не так
+
+
+    @ren_proceed:
+        ; запоминаем атрибуты исходного файла
+        lxi     B, sOpFile
+        call    GetAtr
+        mov     E, A
+        push    D
+        ; обнуляем атрибуты исходного файла
+        mvi     E, 0
+        call    SetAtr
+        ; переименовываем файл
+        lxi     D, sDstFile+2
+        call    file_Rename
+        pop     D
+        jc      @ren_reterror
+        ; восстанавливаем атрибуты
+        lxi     B, sDstFile
+        call    SetAtr
+        xra     A
+        ret
+    @ren_reterror:
+        ; выводим сообщение об ошибке и выходим
+        lxi     B, MenuRenError
+        call    DoDialog
+        ori     -1
+        ret
+
+
+
+;------------------------------------------------------------------------
+; перемещение одного файла
+;------------------------------------------------------------------------
+; на входе:
+;       sOpFile - полное имя файла исходного файла
+;       sDstFile- полное имя файла-результата
+;       OpFlags - флаг выполнения операций
+; на выходе:
+;       A       - 0: файл перемещен
+;                 1: системная ошибка удаления файла
+;                 2: файл пропущен (Skip)
+;                 3: отмена операции копирования (Cancel)
+runMoveFile:
+        lxi     H, MenuMovFExist
+        lxi     D, MenuMovRO
+        call    checkDestFile
+        ora     A
+        rnz
+        ; копируем файл
+        call    CopyFile
+        rnz
+        ; удаляем исходный файл
+        lxi     B, sOpFile
+        call    file_Delete
+        xra     A
+        ret
+
+
+
+;------------------------------------------------------------------------
+; установка атрибутов
+;------------------------------------------------------------------------
+; на входе:
+;        A      - начальные атрибуты файла(ов)
+;       BC      - window
+;       HL      - список координат "кнопок"
+; на выходе:
+;        A      - пользовательские атрибуты файла(ов)
+runAttrib:
+        call    btnInitialize
+        jz      @attr_return
+        ; устанавливаем кнопки согласно начальным атрибутом
+        lda     attrCurrent
+        call    @attr_setattrib
+
+    @attr_redraw:
+        call    btnDraw
+    @attr_getkey:
+        call    kbGetKey
+        cpi     1Fh             ; курсор вниз?
+        cz      @attr_down
+        cpi     1Eh             ; курсор вверх?
+        cz      @attr_up
+        cpi     20h             ; пробел?
+        jz      @attr_switch
+    @attr_stdkey:
+        call    btnDoKey        ; управление курсорм кнопок?
+        jc      @attr_getkey
+        ; Esc или Enter
+        cpi     3               ; это ESC?
+        jnz     @attr_enter     ; -> нет, Enter
+    @attr_return:
+        ori     0FFh
+        ret
+
+    @attr_enter:
+        ; нажат Enter, возвращаем код атрибута
+        call    @hidebtn
+        lhld    BtnAddrs+2
+        inx     H
+        mov     A, M
+        ral
+        ani     2
+        mov     C, A            ; C - R/O
+        lhld    BtnAddrs+6
+        inx     H
+        mov     A, M
+        ani     1               ; A - Sys/Dir
+        ora     C
+        ret
+        ; установка "переключателей" согласно атрибутам
+    @attr_setattrib:
+        lhld    BtnAddrs+6
+        call    @attr_setbox
+        lhld    BtnAddrs+2
+    @attr_setbox:
+        inx     H
+        mvi     M, 0CAh
+        rrc
+        rnc
+        inr     M
+        ret
+
+    @attr_down:
+        mvi     A, 1Ch
+        ret
+    @attr_up:
+        mvi     A, 1Dh
+        ret
+    @attr_switch:
+        lda     BtnCur
+        cpi     2
+        jnc     @attr_getkey
+        call    @hidebtn
+        call    @btngetadr
+        inx     H
+        mov     A, M
+        xri     1
+        mov     M, A
+        jmp     @attr_redraw
+
+
+
+runAtrInfo:
+        lda     attrCurrent
+        mov     E, A
+        lxi     B, sOpFile
+        call    SetAtr
+        ret
+
+
+;------------------------------------------------------------------------
+; дефолтная оконная функция с опросом кнопок окна
+;------------------------------------------------------------------------
+; на входе:
+;       BC      - адрес структуры окна
+;       HL      - адрес координат начала "строки" кнопок
+wndFuncDef:
+        call    btnRun
+        ret
+
+
+doAnyKey:
+        call    kbFlush
+        call    kbGetKey
+        ret
+
+
+;=============================================================================
+;░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+;░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+;░░░░░░░░░░░░░░░░░░░░░░░░░░ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ░░░░░░░░░░░░░░░░░░░░░░░░░░
+;░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+;░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+;=============================================================================
+
+
+
+;------------------------------------------------------------------------
+; проверка наличия файла-назначения и его удаление
+;------------------------------------------------------------------------
+; на входе;
+;       HL      - меню запроса о перезаписи файла
+;       DE      - меню запроса о перезаписи R/O файла
+;   sOpFile     - полное имя файла в формате CP/M ('A:FILE    EXT')
+;   sDstFile    - полное имя файла в противоположной панели ('B:FILE    EXT')
+;   cpyUserSrc  - номер USER-области исходных файлов
+;   cpyUserDst  - номер USER-области наначения
+;   OpFlags     - флаги разрешений
+; на выходе:
+;               - user = cpyUserDst
+;       A       - 0: все ОК, можно копировать
+;                 1: системная ошибка удаления файла
+;                 2: файл пропущен (Skip)
+;                 3: отмена операции копирования (Cancel)
+checkDestFile:
+        shld    @chkf_exists+1
+        xchg
+        shld    @chkf_readonly+1
+        ; проверка на копирование в самого себя
+        lxi     B, sDstFile
+        lda     cpyUserDst
+        mov     E, A
+        call    dsk_SetUser     ; set USER (destination panel)
+        lda     cpyUserSrc
+        cmp     E
+        jnz     @chkf_isPresent
+        ldax    B
+        mov     E, A
+        lda     sOpFile
+        cmp     E
+        jz      @chkf_itself    ; -> error: нельзя копировать в самого себя!
+    @chkf_isPresent:
+        ; проверяем наличие такого файла в Dest
+        call    file_FindFirst
+        mov     A, L
+        ora     H
+        jz      @chkf_done      ; -> нет такого файла, можно копировать
+        ; на диске назначения обнаружен такой же файл
+        lda     OpFlags
+        ani     OP_CPY_ALL
+        jnz     @chkf_isRO      ; -> копируем без запроса
+        ; делаем запрос на перезапись
+  @chkf_exists:
+        lxi     B, 0
+        call    DoDialog
+        jz      @chkf_isRO      ; -> разрешили перезапись
+        cpi     1
+        rnz                     ; -> Skip или Cancel
+        ; выставляем флаг [All] для последующих файлов
+        lda     OpFlags
+        ori     OP_CPY_ALL
+        sta     OpFlags
+    @chkf_isRO:
+        ; проверяем на атрибут Read only
+        lxi     B, sDstFile
+        call    GetAtr
+        ani     FATTR_RW_BIT
+        jz      @chkf_deldst
+        ; файл имеет атрибут только для чтения
+        lda     OpFlags
+        ani     OP_CPY_RO
+        jnz     @chkf_deldst
+  @chkf_readonly:
+        lxi     B, 0            ; делаем запрос на дальнейшие действия
+        call    DoDialog
+        jz      @chkf_deldst
+        cpi     1
+        rnz                     ; -> Skip или Cancel
+        ; выставляем флаг [All] для последующих файлов
+        lda     OpFlags
+        ori     (OP_CPY_ALL or OP_CPY_RO)
+        sta     OpFlags
+    @chkf_deldst:
+        ; удаляем файл
+        lxi     B, sDstFile
+        call    file_Delete
+        ; !!!!!!!!!!! исправить на показ сообщения и прервать операцию !!!!!!!!!!!
+        mvi     A, 1            ; 1 - файл не удалён
+        rc
+    @chkf_done:
+        ; копируем файл
+        xra     A
+        ret
+
+    @chkf_itself:
+        ; нельзя копировать файл в самого себя
+        lxi     B, MenuCpyItSelf
+        call    DoDialog
+        mvi     A, 3            ; отменяем операцию копирования
+        ret
+
+
+
+
+
+;------------------------------------------------------------------------
+; копирование файла из sOpFile в sDstFile
+;------------------------------------------------------------------------
+; на входе:
+;       sOpFile - полное имя файла исходника
+;       sDstFile- полное имя файла назначения
+; на выходе:
+;       A       - 0: файл скопирован, 1: ошибка
+CopyFile:
+        xra     A
+        sta     cbarCount
+        ; инициализируем полосу копирования
+        lxi     B, WndGray
+        lxi     D, 0206h
+        call    wndGetOffs
+        shld    vadrCBar
+        ; получаем размер файла
+        call    user_Src        ; set USER (source panel)
+        lxi     B, sOpFile
+        call    file_Size       ; HL - размер файла в записях
+        ; вычисляем коэффициенты
+        push    H
+        push    H
+        pop     B
+        lxi     H, 0
+        shld    cbarIncr
+        shld    cbarIncr+2
+        lxi     D, 16
+        call    ldiv
+        xchg
+        shld    cbarKoeff+2
+        lxi     H, 0
+        xchg
+        pop     B
+        call    ldiv
+        xchg
+        shld    cbarKoeff
+        ; открываем файл-источник
+        call    dsk_DefFCB
+        lxi     B, sOpFile
+        call    file_Open
+        jc      @copy_errret
+        ; создаем файл-назначения
+        call    user_Dst        ; set USER (destination panel)
+        lxi     B, fcbDstFile
+        call    dsk_SetFCB
+        lxi     B, sDstFile
+        call    file_Create
+        jc      @copy_error
+        ; копируем
+    @copy_loop:
+        ; копируем очередной сектор
+        call    user_Src
+        lxi     B, DEF_FCB
+        call    file_Read
+        jnz     @copy_done      ; -> достигли конца файла
+        call    user_Dst
+        lxi     B, fcbDstFile
+        call    file_Write
+        jnz     @copy_errwr     ; -> ошибка записи или нет места
+        ; корректируем полосу копирования
+        lxi     H, cbarIncr
+        lxi     B, cbarKoeff
+        call    ladd
+        ; while (cbarIncr >= 65536)
+        lhld    cbarIncr+2
+        xchg
+        lxi     H, 0
+        shld    cbarIncr+2
+    @cbar_loop:
+        mov     A, E
+        ora     D
+        jz      @copy_loop
+        ; было переполнение, отрисовываем полосу
+        lda     cbarCount
+        inr     A
+        sta     cbarCount
+        lhld    vadrCBar
+        mvi     M, CHR_COPYFIL
+        inx     H
+        shld    vadrCBar
+        dcx     D
+        jmp     @cbar_loop
+
+    @copy_done:
+        lda     cbarCount
+        cpi     16
+        jnc     @copy_exit
+        lhld    vadrCBar
+        mvi     M, CHR_COPYFIL
+    @copy_exit:
+        call    @copy_close
+        xra     A
+        ret
+    @copy_errwr:
+        call    @copy_close
+        ; удаляем файл-назначения
+        call    user_Dst        ; set USER (destination panel)
+        lxi     B, sDstFile
+        call    file_Delete
+        jmp     @copy_errret
+
+    @copy_error:
+        call    @copy_close
+    @copy_errret:
+        mvi     A, 1
+        ora     A
+        ret
+    @copy_close:
+        call    user_Dst        ; set USER (destination panel)
+        lxi     B, fcbDstFile
+        call    file_Close
+        call    user_Src        ; set USER (source panel)
+        lxi     B, DEF_FCB
+        call    file_Close
+        ret
+
+
+user_Src:
+        lda     cpyUserSrc
+        jmp     dsk_SetUser     ; set USER (source panel)
+
+user_Dst:
+        lda     cpyUserDst
+        jmp     dsk_SetUser     ; set USER (destination panel)
+
+
+
+
+
+
+;------------------------------------------------------------------------
+; выводит строку подсказок для ключей F1-F10
+;------------------------------------------------------------------------
+key_Enable:
+        ; восстанавливаем палитру
+        lxi     H, palNC+18
+        call    key_SetPal
+key_Draw:
+        lxi     D, keyNormal
+        lda     keyFlags
+        ora     A
+        jz      @keyshow
+        lxi     D, keyShift
+        ani     1
+        jnz     @keyshow
+        lxi     D, keyAlf
+
+    @keyshow:
+        push    B
+        lxi     H, keyFirst
+        call    mnuStdAlph
+        ; выводим на экран
+        push    B
+        mvi     C, 0
+        mvi     E, 23
+        call    vidGetAddr          ; HL - vid mem
+        pop     D
+        xchg
+        mvi     C, 32
+        call    memcpy
+        pop     B
+        ret
+
+key_Disable:
+        lxi     D, keyEmpty
+        call    @keyshow
+        ; переигрываем палитру
+        lxi     H, palNC+27
+key_SetPal:
+        mvi     A, 19
+        mvi     C, 1
+        jmp     vidSetPalette
+
+
+
+;------------------------------------------------------------------------
+; создает батник для автозапуска менеджера
+;------------------------------------------------------------------------
+MakeAutoRun:
+        call    dsk_DefIO
+        call    pan_GetActive
+        inx     H
+        mov     A, M
+        push    PSW             ; save USER
+        ora     A
+        jz      @makerun0
+        ; запускаем из USER > 0
+        call    @makerun_open
+        jc      @makerun_error
+        ; копируем в буфер DMA
+        lxi     H, sCmdUser
+        mvi     C, 8
+        ; и отправляем в файл
+        call    @makerun_write
+
+        xra     A
+        call    dsk_SetUser     ; set USER 0
+
+    @makerun0:
+        ; в USER == 0
+        call    @makerun_open
+        jc      @makerun_error
+        ; корректируем строку параметров
+        lda     LeftPanel
+        adi     'A'
+        sta     sCmdAuto+6
+        lda     LeftPanel+1
+        adi     '0'
+        sta     sCmdAuto+13
+        lda     RightPanel
+        adi     'A'
+        sta     sCmdAuto+9
+        lda     RightPanel+1
+        adi     '0'
+        sta     sCmdAuto+14
+        lda     ActivePanel
+        adi     '0'
+        sta     sCmdAuto+12
+        ; копируем в буфер DMA
+        lxi     H, sCmdAuto
+        mvi     C, 16
+        ; и отправляем в файл
+        call    @makerun_write
+
+    @makerun_error:
+        pop     PSW
+        call    dsk_SetUser     ; set USER 0
+        ret
+
+    @makerun_open:
+        ; удаляем возможный старый файл '$$$'.SUB'
+        lxi     B, sAutoBat
+        call    file_Delete
+        ; создаем новый
+        lxi     B, sAutoBat
+        call    file_Create
+        ret
+    @makerun_write:
+        ; отправляем в буфер DMA
+        lxi     D, DEF_DMA
+        call    memcpy
+        ; скидываем в файл
+        lxi     B, DEF_FCB
+        call    file_Write
+        lxi     B, DEF_FCB
+        call    file_Close
+        ret
+
+
+  sAutoBat:     db 'A:$$$     SUB'
+  sCmdUser:     db 6,'USER 0',0
+  sCmdAuto:     db 14,'A:FM A: A: 000',0
+
+
+;------------------------------------------------------------------------
+; удяляет файлы '$$$.SUB'
+;------------------------------------------------------------------------
+; на входе:
+;   - инициализированы LeftPanel.User и RightPanel.User
+;   - установлена USER 0 (атоматом при запуске)
+dsk_DelAuto:
+        call    pan_GetActive
+        inx     H               ; HL += PAN_USER
+        lxi     B, sAutoBat
+        mov     A, M
+        ora     A
+        jz      @del_exec0
+        push    B
+        call    dsk_SetUser
+        call    file_Delete
+        xra     A
+        call    dsk_SetUser
+        pop     B
+    @del_exec0:
+        ; удаляем файл автозапуска '$$$.SUB'
+        jmp     file_Delete
+
+
+
+;------------------------------------------------------------------------
+; инициализация знакогенератора и палитры
+;------------------------------------------------------------------------
+InitScreen:
+        ; создаем сивол признака системного файла
+        lxi     B, SysAttr
+        mvi     E, CHR_SYSFILE  ; ▒
+        call    chgSetChar
+        ; символ выбора файла
+        lxi     B, SelSymb
+        mvi     E, CHR_SELECT   ; √
+        call    chgSetChar
+        ; для имени окон
+        mvi     C, 3Ah
+        mvi     E, CHR_COLON    ; :
+        call    chgSetInvChar
+        mvi     C, 5Ch
+        mvi     E, CHR_SLASH    ; \
+        call    chgSetInvChar
+        ; "пробел" для строки подсказок
+        mvi     C, 20h
+        mvi     E, 0AEh
+        call    chgSetInvChar
+        ; бордюры
+        mvi     E, 0h
+        mvi     D, 3
+    @mkbord:
+        push    D
+        lxi     B, Border
+        mvi     D, 8
+    @ichgl:
+        call    chgSetChar
+        inr     E
+        dcr     D
+        jnz     @ichgl
+        pop     D
+        mov     A, E
+        adi     8
+        mov     E, A
+        dcr     D
+        jnz     @mkbord
+        ; бордюр для сплит-окна
+        call    chgSetChar
+        inr     E
+        call    chgSetChar
+        inr     E
+        call    chgSetChar
+
+        ; устанавливаем палитру
+        call    vidDefPalette
+        ret
+
+
+
+
+;------------------------------------------------------------------------
+; просматриваем строку параметров на предмет дисков в панелях и активной панели
+;------------------------------------------------------------------------
+ParseCmdLine:
+        lda     nDisks
+        mov     C, A
+        lxi     D, 5Ch
+        lxi     H, LeftPanel
+        call    @pcmd_getdsk
+        lxi     D, 6Ch
+        lxi     H, RightPanel
+        call    @pcmd_getdsk
+        ; определяем активную панель
+        lxi     H, ActivePanel
+        mvi     M, 0
+        lda     80h
+        cpi     8
+        rc
+        lda     80h+8
+        cpi     "1"
+        jnz     @pcmd_getuser
+        mvi     M, 1
+    @pcmd_getuser:
+        lda     80h
+        cpi     10
+        rc
+        lda     80h+9
+        sui     '0'
+        rc
+        sta     LeftPanel+1
+
+        lda     80h+10
+        sui     '0'
+        rc
+        sta     RightPanel+1
+        ret
+    @pcmd_getdsk:
+        ldax    D
+        ora     A
+        jz      @pcmd_setdsk
+        cmp     C
+        jc      @pcmd_deca
+        mov     A, C
+    @pcmd_deca:
+        dcr     A
+    @pcmd_setdsk:
+        mov     M, A
+        ; обнуляем user-область
+        inx     H
+        mvi     M, 0
+        ret
+
+
+;------------------------------------------------------------------------
+; инициализация некоторых переменных
+;------------------------------------------------------------------------
+InitVariables:
+        ; инициализируем память под списки файлов
+        call    lst_InitMem
+        lxi     B, WndRightPan
+        ; высоту списков
+        call    wndGetHeight
+        sui     2
+        sta     lst$Height
+        ; инициализируем списки
+        lxi     H, 0
+        shld    Lst$Ptr         ; нет активного списка
+        ; список левой панели
+        lxi     B, LstLeftPan
+        call    lst_Init
+        ; список правой панели
+        lxi     B, LstRightPan
+        call    lst_Init
+
+        ; инициализируем меню user и выбора диска
+        call    init_userdlg
+        call    init_dskdlg
+
+        ; keyb input flags
+        xra     A
+        sta     keyFlags
+        ; dialogs
+        sta     dlgPosY
+        ; viewer
+        sta     viWrap
+        ; ком. строка
+        sta     cmdlCount
+        mov     C, A
+        mvi     E, 22
+        call    vidGetAddr
+        shld    cmddVAddr
+        ; получаем адреса CCP
+        lhld    6
+        lxi     B, -806h
+        dad     B
+        shld    CCPAddr
+        lxi     B, 6
+        dad     B
+        mov     C, M
+        inx     B             ; BC - размер буфера ввода CCP, with end #0
+        inx     H
+        shld    CCPInpBuf     ; начало буфера CCP
+        inx     H
+        dad     B
+        shld    CCPInpPtr     ; адрес указателя на буфер CCP
+        ret
+
+
+;=============================================================================
+;░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+;░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+;░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ ДАННЫЕ ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+;░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+;░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+;=============================================================================
+
+; Панели файлов
+  LeftPanel:    db 0                    ; отображаемый диск (0-A, 1-B, ...)
+                db 0                    ; user (0-15)
+                dw LstLeftPan           ; связанный с окном список файлов
+                dw WndLeftPan           ; окно
+
+  RightPanel:   db 0                    ; отображаемый диск (0-A, 1-B, ...)
+                db 0                    ; user (0-15)
+                dw LstRightPan          ; связанный с окном список файлов
+                dw WndRightPan          ; окно
+
+
+  WndLeftPan:   db 3, 80h,CHR_COLON, CHR_SLASH, 81h,82h, ' '
+                db 0,0, 16,22,BORDER_BLUE,' '
+  WndRightPan:  db 3, 83h,CHR_COLON, CHR_SLASH, 84h,85h, ' '
+                db 16,0,16,22,BORDER_BLUE,' '
+
+;-----------------------------------------------------------------------------
+;-----------------------------------------------------------------------------
+
+  Border:       db 7fh,7fh,7fh,7fh,7fh,7fh,7fh,7fh        ; █ left top corner
+                db 0ffh,0ffh,0ffh,0ffh,0ffh,0ffh,0ffh,0ffh; █ top
+                db 0feh,0feh,0feh,0feh,0feh,0feh,0feh,0feh; █ right top corner
+                db 16h,16h,16h,16h,16h,16h,16h,16h        ; │ right
+                db 16h,16h,16h,0F6h,06h,0FEh,0FEh,00h     ; ┘ right bot corner
+                db 00h,00h,00h,0ffh,00h,0ffh,0ffh,00h     ; ─ bottom
+                db 68h,68h,68h,6Fh,60h,7Fh,7Fh,00h        ; └ left bot corner
+                db 68h,68h,68h,68h,68h,68h,68h,68h        ; │ left
+    BordSpl:    db 68h,68h,68h,68h,6Fh,68h,68h,68h        ; ├ left split
+                db 00h,00h,00h,00h,0FFh,00h,00h,00h       ; ─ split line
+                db 16h,16h,16h,16h,0F6h,16h,16h,16h       ; ┤ right split
+
+
+  SysAttr:      db 2Ah,54h,2Ah,54h,2Ah,54h,2Ah,54h        ; ▒
+  SelSymb:      db 00h,1Eh,10h,10h,50h,30h,10h,00h        ; √
+
+
+  ChkBoxNo:     db 0FCh,86h,86h,86h,86h,0FEh,7Eh,00h      ; [ ]
+  ChkBoxYes:    db 0FCh,86h,0B6h,0B6h,86h,0FEh,7Eh,00h    ; [■]
+
+
+
+
+
+
+;-----------------------------------------------------------------------------
+; строки состояния
+;-----------------------------------------------------------------------------
+  keyFirst:     db 90h
+  ; подсказки по F1-F5
+  keyNormal:    db 'Help',9,9,'View',9,9,'Copy',9,9,'Rename',9,9,'Delete',0   ; подсказки по F1-F5
+  ; подсказки по F6-F10
+  keyShift:     db 'Usr L',9,'Usr R',9,'Sort',9,9,'Attrib',9,9,'Quit',9,9,0 ; подсказки по F6-F10
+
+  keyAlf:       db 'Left',9,9,'Right',9,'    ',9,9,'Move  ',9,9,'Screen',0   ; подсказки по F1-F5
+
+  ; пустая строка подсказок
+  keyEmpty:     db '    ',9,9,'    ',9,9,'    ',9,9,'      ',9,9,'      ',0   ; подсказки по F1-F5
+
+
+
+if MOD_CCP
+  ALLIGN set 0CC06h-$
+
+  ; добиваем до 0CC06 - начала модуля BDOS
+  rept ALLIGN
+    db 1Ah
+  endm
+endif
+
+ENDCODE:
+
+end Begin

@@ -1,0 +1,1350 @@
+;=============================================================================
+;░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+;░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+;░░░░░░░░░░░░░░░░░░░░░ КОМПИЛЯЦИЯ И ВЫВОД ДИАЛОГОВЫХ ОКОН ░░░░░░░░░░░░░░░░░░░░
+;░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+;░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+;=============================================================================
+
+
+
+;------------------------------------------------------------------------
+; формирование и вывод диалогового окна на экран
+;------------------------------------------------------------------------
+; на входе:
+;       BC      - адрес структуры диалога
+; на выходе:
+;       A       - результат выполнения
+DoDialog:
+        lda     dlgPosY
+        adi     4
+        sta     dlgPosY
+        push    B
+        pop     H               ; HL = &Dialog[0]
+        ; формируем алфавит
+        mov     E, M
+        inx     H
+        mov     D, M            ; BC - строка с содержимым окна
+        inx     H               ; [HL] - место в знакогенераторе
+        call    mnuFrmAlph
+        inx     H               ; HL = &Dialog[2] (заголовок окна)
+        ; форматируем содержимое окна
+        lxi     D, mnuBuff
+        call    mnuFormat
+
+        ; корректируем размеры и положение окна
+        lda     mnuHeight
+        inr     A
+        inr     A
+        mov     D, A
+        MtoBC                   ; BC = &Wnd
+        mov     E, M            ; E - width
+        inx     H
+        push    H
+        lxi     H, WX
+        dad     B
+        mov     A, E
+        ral
+        jnc     @dodlg_setpos
+        ; пропускаем центровку окна
+        ana     A
+        rar
+        mov     E, A            ; width = width & 0x7F
+        inx     H
+        jmp     @dodlg_setsize
+    @dodlg_setpos:
+        lda     SCRWDT
+        sub     E
+        rar
+        mov     M, A            ; Wnd.x = (screenWidth - wndWidth) / 2
+        inx     H
+;        lda     SCRHGT
+;        sub     D
+;        rar
+        lda     dlgPosY
+        inr     A
+        mov     M, A            ; Wnd.y = (screenHeight - (wndHeight+2)) / 2
+    @dodlg_setsize:
+        inx     H
+        mov     M, E            ; Wnd.width = E
+        inx     H
+        mov     M, D            ; Wnd.height = mnuHeight+2
+        pop     H
+        ; готовим знакогенератор под название окна
+        mov     E, M
+        inx     H
+        mov     D, M            ; DE = &headWndStr
+        inx     H
+        push    H               ; save Dialog[4] - wndFunc
+        push    B               ; save &Wnd
+        ldax    D               ; A - длина заголовка окна
+        stax    B               ; Wnd->Name[0] = A
+
+        inx     D
+        push    D               ; [SP+2] - строка
+        mov     D, A
+        inx     B
+        ldax    B
+        mov     E, A            ; E - знакоместо
+        mov     C, D            ; C - длина строки
+        call    chgInvString
+        ; сохраняем фон под окном
+        lxi     B, dlgAlph
+        mvi     A, ' '
+        call    strchr
+        mov     E, A
+        pop     B               ; BC = &Wnd
+        lxi     H, WBACKGR
+        dad     B
+        lda     dlgFirst
+        add     E
+        mov     M, A
+        call    wndSaveBkGr
+        ; выводим само окно
+        call    wndShow
+        ; выводим содержимое окна
+        lxi     D, mnuBuff
+        call    wndPutStrings
+        ; вызываем оконную функцию
+        pop     H               ; HL = &Dialog[4]
+        push    B               ; save &Wnd
+        mov     E, M
+        inx     H
+        mov     D, M
+        inx     H
+        xchg
+        shld    @clwnd+1
+        xchg                    ; HL = адрес координат "строки" кнопок окна
+    @clwnd:
+        ; вызов оконной функции
+        call    0000            ; func(&Wnd, &ButtonsXY[])
+        ; восстанавливаем фон и выходим
+        pop     B
+        push    PSW
+        call    wndHide
+        lda     dlgPosY
+        sui     4
+        sta     dlgPosY
+        pop     PSW             ; возвращаем результат
+        ret
+
+
+
+
+
+;------------------------------------------------------------------------
+; формирует содержимое окна меню
+;------------------------------------------------------------------------
+; на входе:
+;       BC      - строка: <тип строки><параметры>
+;       DE      - буфер под результатирующую строку
+; save: HL
+mnuFormat:
+        push    H
+        mov     L, C
+        mov     H, B
+        xra     A
+        sta     mnuHeight
+    @frmloop:
+        mov     A, M
+        cpi     ' '
+        jnc     @frm_char       ; -> просто символ в вых. строку
+        inx     H
+        cpi     2               ; имя конечного файла?    <2, знакоместо>
+        jz      @frm_dname
+        cpi     3               ; имя исходного файла?    <3, знакоместо>
+        jz      @frm_sname
+        cpi     4               ; имя текущего диска?     <4, знакоместо>
+        jz      @frm_curdsk
+        cpi     5               ; имя диска назначения?   <5, знакоместо>
+        jz      @frm_dstdsk
+        cpi     6               ; количество файлов?      <6, знакоместо>
+        jz      @frm_nfiles
+        cpi     7               ; непосредственно символ? <7, symb>
+        jz      @frm_symb
+        cpi     1               ; заполняем символом?     <1, count>, 'symbol'
+        jz      @frm_memset
+        ; что-то неизвестное, заканчиваем строку и уходим
+        mvi     A, '$'
+        stax    D
+        inx     D
+        pop     H
+        ret
+
+    @frmnext:
+        inx     H
+        jmp     @frmloop
+
+    @frm_char:
+        cpi     '$'
+        jnz     @frm_putchar
+    @frm_endstr:
+        lda     mnuHeight
+        inr     A
+        sta     mnuHeight
+        xra     A
+    @frm_putchar:
+        stax    D
+        inx     D
+        jmp     @frmnext
+
+    ; короткое имя файла (из sDstFile)
+    @frm_dname:
+        lxi     B, sDstFile+2
+        jmp     @frm_sfndo
+    ; короткое имя файла (из sOpFile)
+    @frm_sname:
+        lxi     B, sOpFile+2
+    @frm_sfndo:
+        call    FN2Gen
+        jmp     @frm_endstr
+
+
+    ; количество файлов (из nFiles)
+    @frm_nfiles:
+        lda     nFiles
+        mov     C, A
+        mvi     B, 0
+        call    NumToGen
+        jmp     @frmnext
+
+    ; просто символ в выходной поток
+    @frm_symb:
+        mov     A, M
+        stax    D
+        inx     D
+        jmp     @frmnext
+
+    ; добавляем в поток символ, в заданном количестве
+    @frm_memset:
+        mov     C, M
+        inx     H
+        mov     A, M
+      @frm_mstloop:
+        stax    D
+        inx     D
+        dcr     C
+        jnz     @frm_mstloop
+        jmp     @frmnext
+
+    ; имя текущего диска (из sOpFile - 'A:')
+    @frm_curdsk:
+        lxi     B, sSrcPath
+        jmp     @frm_dodsk
+    ; имя диска назначения (из sDstFile - 'B')
+    @frm_dstdsk:
+        lxi     B, sDstPath
+    @frm_dodsk:
+        call    frm_Str2Gen
+        jmp     @frmnext
+
+;------------------------------------------------------------------------
+; задание числа в знакогенераторе
+;------------------------------------------------------------------------
+; на входе:
+;       BC      - число (0-999)
+;       M       - указатель на нач. позицию в знакогенераторе
+; на выходе:
+;       sBufCnv - число в символьном формате
+;               + оно же в знакогенераторе с позиции заданной в рег. E
+NumToGen:
+        push    D
+        lxi     D, sBufCnv+1
+        call    utoa
+        ; готовим знакогенератор
+        jmp     nRunGen
+;------------------------------------------------------------------------
+; задание имени файла в знакогенераторе и в окне диалога
+;------------------------------------------------------------------------
+; на входе:
+;       BC      - указатель на имя файла (+0 - полное имя, +2 - короткое имя)
+;       M       - указатель на нач. позицию в знакогенераторе
+; на выходе:
+;       sBufCnv - имя файла в формате DOS (pascal-строка)
+;               + оно же в знакогенераторе с позиции заданной в [HL]
+FN2Gen:
+        push    D
+        ; конвертируем имя файла
+        lxi     D, sBufCnv+1
+        call    CP2DOS
+nRunGen:
+        pop     D
+        lxi     B, sBufCnv+1
+
+frm_Str2Gen:
+        push    D
+        ; заносим строку в знакогенератор
+        mov     E, M
+        push    H
+        push    B               ; первый параметр для chgSetString()
+        call    strlen
+        sta     sBufCnv
+        mov     C, A
+        call    chgSetString
+        ; и в буфер окна диалога
+        pop     H
+        pop     D
+        lda     sBufCnv
+        mov     B, M
+        mov     C, A
+        call    chgGetString                  ; и в буфер окна диалога
+        ret
+
+
+
+;------------------------------------------------------------------------
+; формирует алфавит для диалогового окна
+;------------------------------------------------------------------------
+; на входе:
+;       DE      - содержимое окна
+;       [HL]    - нач. символ знакогенератора
+; на выходе:
+;       BC      - закодированное содержимое окна
+; save: HL
+mnuStdAlph:
+        push    H
+        mov     A, M
+        lxi     H, dlgAlph
+        jmp     doAlphavit
+mnuFrmAlph:
+        push    H
+        mov     A, M
+        lxi     H, dlgAlph
+        ; добавляем в алфавит символ пробела
+        mvi     M, ' '
+        inx     H
+    doAlphavit:
+        mvi     M, 0
+        dcr     A
+        sta     dlgFirst
+        lxi     B, dlgBuff
+        call    @frmalp_entry
+        xra     A
+        stax    B
+        lxi     B, dlgAlph
+        call    strlen
+        pop     H
+        push    H
+        mov     E, M
+        mov     C, A            ; C - длина алфавита
+        lxi     H, dlgAlph
+        push    H
+        call    chgSetString
+        pop     H
+        lxi     B, dlgBuff
+        ret
+
+
+    @frmalp_entry:
+        ; BC    - &dlgBuff[j]
+        ; HL    - &алфавит[i]
+        ; DE    - исходная строка
+    @frmalp_loop:
+        ldax    D
+        ora     A
+        jz      @fmralp_done
+        cpi     9               ; 0..8 - command
+        jc      @frmalp_cmd
+        push    B
+        jnz     @frmalp_chk
+        mvi     A, 0AEh         ; заменяем 0x9 на 0xAE
+        jmp     @frmalp_put     ; -> отправляем в буфер
+    @frmalp_chk:
+        cpi     '$'
+        jz      @frmalp_put     ; -> отправляем в буфер
+        lxi     B, dlgAlph
+        call    strchr
+        jnz     @frmalp_code    ; -> кодируем и в буфер
+        ; добавляем букву в алфавит
+        ldax    D
+        mov     M, A
+        inx     H
+        mvi     M, 0
+        call    strchr
+    @frmalp_code:
+        ; заносим символ в буфер
+        mov     C, A
+        lda     dlgFirst
+        add     C
+    @frmalp_put:
+        pop     B
+    @frmalp_put2:
+        stax    B
+        inx     B
+    @frmalp_next:
+        inx     D
+        jmp     @frmalp_loop
+
+    @frmalp_cmd:
+        inx     D
+        cpi     8
+        jz      @frmalp_newstr
+        stax    B
+        inx     B
+        ldax    D
+        jmp     @frmalp_put2
+
+    @frmalp_newstr:
+        ; включаем обработку другой строки
+        ; BC - out buffer
+        ; HL - &alphavit[i]
+        ; DE - &str[j]
+        push    D
+        ldax    D
+        inx     D
+        push    PSW
+        ldax    D
+        mov     D, A
+        pop     PSW
+        mov     E, A
+        call    @frmalp_entry
+        pop     D
+        inx     D
+        jmp     @frmalp_next
+
+    @fmralp_done:
+        mvi     M, 0
+        ret
+
+
+
+;=============================================================================
+;░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+;░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+;░░░░░░░░░░░░░░░░░░░░░░░░░░░ МЕНЮ ДИАЛОГОВЫХ ОКОН ░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+;░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+;░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+;=============================================================================
+
+;------------------------------------------------------------------------
+; опрос кнопок диалога и возврат нажатой кнопки
+;------------------------------------------------------------------------
+; на входе:
+;       HL      - адрес строки с названиями кнопок (конец - символ <= ' '))
+; на выходе:
+;       A       - номер нажатой кнопки
+btnRun:
+        call    btnInitialize
+        rz
+
+    @mnubtn_loop:
+        call    btnDraw
+        call    kbFlush
+    @mnu_getkey:
+        call    kbGetKey
+        call    btnDoKey
+        rnc
+        jmp     @mnu_getkey
+
+
+
+;------------------------------------------------------------------------
+; обработка нажатой клавиши клавиатуры
+;------------------------------------------------------------------------
+; на входе:
+;       A       - код клавиши
+; на выходе:
+;       CF      - 0: нажат ENTER или ESC (A - номер текущей клавиши)
+;                 1: ничего
+btnDoKey:
+        cpi     1Dh
+        mvi     B, -1
+        cz      btnNext
+        cpi     1Ch
+        mvi     B, 1
+        cz      btnNext
+        cpi     1Bh
+        jz      @mnu_retesc
+        cpi     0Dh
+        jz      @mnu_done
+        stc
+        ret
+    @mnu_retesc:
+        lda     BtnNum
+        dcr     A
+        ret
+    @mnu_done:
+        lda     BtnCur
+        ora     A
+        ret
+
+
+;------------------------------------------------------------------------
+; создание массива "кнопок" из строки
+;------------------------------------------------------------------------
+; на входе:
+;       BC      - адрес структуры окна
+;       HL      - указатель на (x,y) начала "строки" кнопок
+; на выходе:
+;       A       - количество кнопок (дублирует BtnNum)
+;       ZF      - 1: ошибка (кнопок не обнаружено)
+;       BtnNum  - количество кнопок
+btnInitialize:
+        xra     A
+        sta     BtnNum
+        sta     BtnCur
+        lxi     D, BtnAddrs
+  @btn_init_loop:
+        mov     A, M
+        cpi     0FFh
+        jz      @btnset_exit
+        push    B
+        push    D
+        mov     D, A            ; D = X
+        inx     H
+        mov     E, M            ; E = Y
+        inx     H
+        xthl                    ; [SP] = HL / HL = &BtnAddrs[i]
+        push    H
+        call    wndGetOffs
+        pop     D               ; DE = &BtnAddrs[i]
+
+        mov     A, M
+        inr     A
+        sta     BtnSpace
+
+    @btnset_loop:
+        call    @lenbtn
+        mov     A, C
+        ora     B
+        jz      @btnset_done
+        ; сохраняем адрес очередной "кнопки"
+        xchg
+        mov     M, C
+        inx     H
+        inx     H
+        mov     M, E
+        inx     H
+        mov     M, D
+        inx     H
+        xchg
+        lda     BtnNum
+        inr     A
+        sta     BtnNum
+        ; переходим к следующей
+        dad     B
+        jmp     @btnset_loop
+    @btnset_done:
+        pop     H
+        pop     B
+        jmp     @btn_init_loop
+    @btnset_exit:
+        lda     BtnNum
+        ora     A
+        ret
+
+
+
+; отрисовка текущей кнопки
+; на входе:
+;       BtnCur  - номер текущей кнопки
+btnDraw:
+        call    @btngetadr
+        push    H
+        push    H               ; параметр для chgSetString
+        lxi     D, sBufCnv
+        mov     A, C
+        stax    D
+        inx     D
+        call    memcpy
+        mvi     E, 0A0h
+        call    chgSetString
+        pop     D
+        mvi     B, 0A0h
+        call    chgGetString
+        ret
+
+; восстанавливает текущую кнопку
+; на входе:
+  @hidebtn:
+        push    B
+        call    @btngetadr
+        lxi     D, sBufCnv
+        xchg
+        mov     C, M
+        inx     H
+        call    memcpy
+        pop     B
+        ret
+
+  @btngetadr:
+        lda     BtnCur
+        mov     L, A
+        mvi     H, 0
+        dad     H
+        dad     H               ; HL = BtnCur*4
+        lxi     D, BtnAddrs
+        dad     D               ; HL = &BtnAddrs[BtnCur]
+        mov     C, M            ; C - len
+        inx     H
+        inx     H
+        mov     E, M
+        inx     H
+        mov     D, M
+        xchg                    ; HL - &button str
+        ret
+
+
+; возвращает длину кнопки
+; на входе:
+;       HL      - указатель на строку, начинающуюся "пробелом"
+; на выходе:
+;       BC      - длина названия кнопки
+  @lenbtn:
+        push    H
+        lda     BtnSpace
+        mov     B, A
+        mvi     C, 0
+        inx     H
+    @lenbtn_loop:
+        mov     A, M
+        cmp     B
+        jc      @lenbtn_end
+        inr     C
+        inx     H
+        jmp     @lenbtn_loop
+    @lenbtn_end:
+        mvi     B, 0
+        mov     A, C
+        ora     A
+        jz      @lenbtn_exit
+        inr     C
+        inr     C
+    @lenbtn_exit:
+        pop     H
+        ret
+
+; переход к след./пред. кнопке
+btnNext:
+        push    PSW
+        call    @hidebtn
+        lda     BtnNum
+        mov     C, A
+        lda     BtnCur
+        add     B
+        jp      @btnisl
+        mov     A, C
+        dcr     A
+        jmp     @btnshow
+    @btnisl:
+        cmp     C
+        jc      @btnshow
+        xra     A
+    @btnshow:
+        sta     BtnCur
+        call    btnDraw
+        pop     PSW
+        ret
+
+
+
+
+;=============================================================================
+;░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+;░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+;░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ ДАННЫЕ ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+;░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+;░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+;=============================================================================
+BEGIN_MNU_DATA:
+; '$' - конец строки (заменяется на ноль)
+
+  WndGray:      db 6, 88h,89h,8Ah,8Bh,8Ch,8Dh
+                db 0,0,0,0,BORDER_GRAY,0B0h
+                dw SAVE_BUF_ONEW
+
+  WndRed:       db 6, 98h,99h,9Ah,9Bh,9Ch,9Dh
+                db 0,0,0,0,BORDER_RED,0D8h
+                dw SAVE_BUF_REDW
+
+;-----------------------------------------------------------------------------
+; Копирование файлов
+;-----------------------------------------------------------------------------
+  sCopy:        db 4, 'Copy'    ; название окон
+
+; запрос на копирование файла
+  MenuCpyOne:   dw sCpyOne              ; ptr на содержимое окна
+                db 0B0h
+                dw WndGray
+                db 22                   ; ширина окна
+                dw sCopy                ; заголовок окна
+                dw wndFuncDef
+                db 3,6                  ; координаты "кнопок"
+                db 0FFh
+
+
+; запрос на копирование нескольких файлов
+  MenuCpyMulti: dw sCpyMult
+                db 0B0h
+                dw WndGray
+                db 22
+                dw sCopy
+                dw wndFuncDef
+                db 3,4
+                db 0FFh
+
+; инфа о копировании файла
+  MenuCpyFile:  dw sCpyFile
+                db 0B0h
+                dw WndGray
+                db 22
+                dw sCopy
+                dw runCpyFile
+
+; запрос о действиях при существующем файле
+  MenuCpyFExist:dw sCpyFExist
+                db 0D8h
+                dw WndRed
+                db 28
+                dw sCopy
+                dw wndFuncDef
+                db 0,4
+                db 0FFh
+
+; запрос о действиях при атрибутах файла Read Only
+  MenuCpyRO:    dw sCpyRO
+                db 0D8h
+                dw WndRed
+                db 28
+                dw sCopy
+                dw wndFuncDef
+                db 0,4
+                db 0FFh
+
+; сообщение о недопустимости копирования в самого себя
+  MenuCpyItSelf:dw sCpyItSelf
+                db 0D8h
+                dw WndRed
+                db 20
+                dw sCopy
+                dw wndFuncDef
+                db 7,4
+                db 0FFh
+
+
+; сообщение о ошибке копирования
+  MenuCpyError: dw sCpyError
+                db 0D8h
+                dw WndRed
+                db 18
+                dw sCopy
+                dw wndFuncDef
+                db 6,4
+                db 0FFh
+
+
+; сами сообщения
+  sCpyOne:      db '$', 'Copy','$'              ; Copy
+                db 8
+                dw cpyFT
+      cpyBtn:   db 'Copy'
+                db 8
+                dw btnCancel
+                db 0
+
+      cpyFT:    db 3,0CCh                       ; filename.ext
+                db 'to','$'                     ; to
+                db 5,0C6h,3,0CCh            ; B:filename.ext
+                db '$'
+                db 0
+
+  sCpyMult:     db '$'
+                db 'Copy '
+                db 8
+                dw sNFiles
+                db 8
+                dw cpyBtn
+                db 0
+
+      sNFiles:  db 6,0CCh,' files to','$'
+                db 5,0C6h,'$'
+                db '$'
+                db 0
+
+
+  sCpyFile:     db '$'
+                db 'Copying'
+      sBarCpy:  db 8
+                dw sTheFile
+                db 8
+                dw cpyFT                        ; from to dest
+                db 1,16,CHR_SYSFILE             ; ▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒
+                db '$'
+                db 0
+
+  sCpyFExist:   db 8
+                dw sFExists             ; File already exists
+      btnCExt:  db 5,0EEh,3,0F4h                            ; B:FILENAME.EXT
+                db '$'
+                db 'Copy'
+      btnASC:   db '  All  Skip'
+      btnCancel:db '  Cancel'
+                db '$'
+                db 0
+
+      sFExists: db '$'
+                db 'File already exists','$'
+                db 0
+      sWarnRO:  db '$'
+                db 'File is marked read only','$'
+                db 0
+
+      sTheFile: db ' the file','$'
+                db 0
+
+
+  sCpyRO:       db 8
+                dw sWarnRO              ; File is marked read only
+                db 8
+                dw btnCExt
+                db 0
+
+
+
+  sCpyItSelf:   db '$'
+                db 'You can not copy','$'
+                db 'a file to itself','$'
+    btnOK:      db '$'
+                db 'OK','$'                                     ; OK
+                db 0
+
+
+
+  sCpyError:    db 8
+                dw sDiskIOErr
+                db 'or no space','$'
+                db 8
+                dw btnOK
+                db 0
+
+    sDiskIOErr: db '$'
+                db 'Disk I/O error','$'
+                db 0
+
+
+
+
+
+
+
+;-----------------------------------------------------------------------------
+; Удаление файлов
+;-----------------------------------------------------------------------------
+  sDelete:      db 6, 'Delete'  ; название окон
+
+; запрос на удаление одного файла
+
+  MenuDelOne:   dw sDelOne
+                db 0B0h
+                dw WndGray
+                db 26
+                dw sDelete
+                dw wndFuncDef
+                db 4,4
+                db 0FFh
+
+; запрос на удаление нескольких файлов
+  MenuDelMulti: dw sDelMulti
+                db 0B0h
+                dw WndGray
+                db 22
+                dw sDelete
+                dw wndFuncDef
+                db 2,4
+                db 0FFh
+
+; инфа о удалении файла
+  MenuDelFile:  dw sDelFile
+                db 0B0h
+                dw WndGray
+                db 22
+                dw sDelete
+                dw runDelFile
+
+; запрос на удаление файла при групповом удалении
+  MenuDelReqOne:dw sDelReqOne
+                db 0D8h
+                dw WndRed
+                db 26
+                dw sDelete
+                dw wndFuncDef
+                db 0,4
+                db 0FFh
+
+; запрос о удалении файла только для чтения
+  MenuDelRO:    dw sDelRO
+                db 0D8h
+                dw WndRed
+                db 28
+                dw sDelete
+                dw wndFuncDef
+                db 1,4
+                db 0FFh
+
+
+; сами сообщения
+  sDelOne:      db '$'
+                db 'Do you wish to delete','$'
+                db 3, 0CCh                      ; filename.ext
+      btnDel:   db '$'
+                db 'Delete'
+                db 8
+                dw btnCancel
+                db 0
+
+  sDelMulti:    db '$'
+                db 'You have selected','$'
+                db 6, 0CAh                      ; num of files
+                db ' files','$'
+                db 8                            ; Delete  Cancel
+                dw btnDel
+                db 0
+
+  sDelFile:     db '$'
+                db 'Delete'
+                db 8
+                dw sTheFile
+      btnScrFN: db 4,0C6h,3,0CCh                ; A:filename.ext
+                db '$'
+                db 0
+
+  sDelReqOne:   db '$'
+                db 'You are deleting','$'
+      btnWDel:  db 4,0EEh,3,0F4h                ; A:filename.ext
+                db '$'
+                db 'Del'
+                db 8
+                dw btnASC               ; All Skip Cancel
+                db 0
+
+  sDelRO:       db 8
+                dw sWarnRO
+                db 8
+                dw btnWDel                                      ; Del All Skip Cancel
+                db 0
+
+
+;-----------------------------------------------------------------------------
+; переименование файлов
+;-----------------------------------------------------------------------------
+  sRename:      db 6, 'Rename'          ; название окна
+
+; запрос на копирование файла
+  MenuRenOne:   dw sRenOne              ; ptr на содержимое окна
+                db 0B0h
+                dw WndGray
+                db 22
+                dw sRename              ; заголовок окна
+                dw runRenOne
+                db 2,6
+                db 0FFh
+
+  MenuRenError: dw sRenError
+                db 0D8h
+                dw WndRed
+                db 20
+                dw sRename
+                dw wndFuncDef
+                db 7,4
+                db 0FFh
+
+  ; запрос на перезапись существующего файла
+  MenuRenFExist:dw sRenFExist
+                db 0D8h
+                dw WndRed
+                db 24
+                dw sRename
+                dw wndFuncDef
+                db 3,4
+                db 0FFh
+
+; запрос о переименовании файла только для чтения
+  MenuRenRO:    dw sRenRO
+                db 0D8h
+                dw WndRed
+                db 28
+                dw sRename
+                dw wndFuncDef
+                db 5,4
+                db 0FFh
+
+
+
+  ; сами сообщения
+  sRenOne:      db '$'
+                db 'Rename','$'
+                db 3, 0CCh              ; filename.ext
+                db 'to','$'
+                db '$'                  ; строка ввода
+      renBtn:   db '$'
+                db 'Rename'
+                db 8
+                dw btnCancel
+                db 0
+
+  sRenError:    db 8
+                dw sDiskIOErr
+                db 'or bad file name','$'
+                db 8
+                dw btnOK
+                db 0
+
+  sRenFExist:   db 8
+                dw sFExists             ; File already exists
+      btnRenDst:db 4,0EEh,2,0F4h        ; B:FILENAME.EXT
+                db 8
+                dw renBtn
+                db 0
+
+  sRenRO:       db 8
+                dw sWarnRO              ; File is marked read only
+                db 8
+                dw btnRenDst
+                db 0
+
+
+;-----------------------------------------------------------------------------
+; Перемещение файлов
+;-----------------------------------------------------------------------------
+  sMove:        db 4, 'Move'            ; название окон
+
+; запрос на перемещение файла
+  MenuMovOne:   dw sMovOne              ; ptr на содержимое окна
+                db 0B0h
+                dw WndGray
+                db 22                   ; ширина окна
+                dw sMove                ; заголовок окна
+                dw wndFuncDef
+                db 3,6                  ; координаты "кнопок"
+                db 0FFh
+
+
+; запрос на перемещение нескольких файлов
+  MenuMovMulti: dw sMovMult
+                db 0B0h
+                dw WndGray
+                db 22
+                dw sMove
+                dw wndFuncDef
+                db 3,4
+                db 0FFh
+
+; инфа о копировании файла
+  MenuMovFile:  dw sMovFile
+                db 0B0h
+                dw WndGray
+                db 22
+                dw sMove
+                dw runMoveFile
+
+; запрос о действиях при существующем файле
+  MenuMovFExist:dw sMovFExist
+                db 0D8h
+                dw WndRed
+                db 28
+                dw sMove
+                dw wndFuncDef
+                db 0,4
+                db 0FFh
+
+; запрос о действиях при атрибутах файла Read Only
+  MenuMovRO:    dw sMovRO
+                db 0D8h
+                dw WndRed
+                db 28
+                dw sMove
+                dw wndFuncDef
+                db 0,4
+                db 0FFh
+
+; сообщение о ошибке копирования
+  MenuMovError: dw sCpyError
+                db 0D8h
+                dw WndRed
+                db 18
+                dw sMove
+                dw wndFuncDef
+                db 6,4
+                db 0FFh
+
+
+; сами сообщения
+  sMovOne:      db '$', 'Move','$'
+                db 8
+                dw cpyFT
+      movBtn:   db 'Move'
+                db 8
+                dw btnCancel
+                db 0
+
+  sMovMult:     db '$'
+                db 'Move '
+                db 8
+                dw sNFiles
+                db 8
+                dw movBtn
+                db 0
+  sMovFile:     db '$'
+                db 'Moving'
+                db 8
+                dw sBarCpy
+                db 0
+
+  sMovFExist:   db 8
+                dw sFExists             ; File already exists
+      btnMExt:  db 5,0EEh,3,0F4h                            ; B:FILENAME.EXT
+                db '$'
+                db 'Move'
+                db 8
+                dw btnASC
+                db 0
+
+  sMovRO:       db 8
+                dw sWarnRO              ; File is marked read only
+                db 8
+                dw btnMExt
+                db 0
+
+
+
+
+;-----------------------------------------------------------------------------
+; установка атрибутов
+;-----------------------------------------------------------------------------
+  sAttr:        db 6, 'Attrib'          ; название окон
+
+; запрос на изменение атрибутов одного файла
+  MenuAtrOne:   dw sAtrOne              ; ptr на содержимое окна
+                db 0B0h
+                dw WndGray
+                db 22
+                dw sAttr                ; заголовок окна
+                dw runAttrib
+                db 3,4                  ; Read only
+                db 3,5                  ; System
+                db 4,7                  ; Set  Cancel
+                db 0FFh
+
+; запрос на изменение атрибутов нескольких файлов
+  MenuAtrMulti: dw sAtrMulti
+                db 0B0h
+                dw WndGray
+                db 18
+                dw sAttr
+                dw runAttrib
+                db 1,4                  ; Read only
+                db 1,5
+                db 2,7
+                db 0FFh
+
+; информация о установке атрибутов
+  MenuAtrInfo:  dw sAtrInfo
+                db 0B0h
+                dw WndGray
+                db 22
+                dw sAttr
+                dw runAtrInfo
+
+  ; сами сообщения
+
+  sAtrOne:      db '$'
+                db 'Set'
+                db 8
+                dw sAttribut
+                db ' file','$'
+                db 3,0CCh                       ; filename.ext
+    sAtrBtn:    db '$'
+                db 7,0CAh,7,0C9h,'Read',7,0C9h,'only','$'
+                db 7,0CAh,7,0C9h,'System   ','$'
+                db '$'
+                db ' Set'
+                db 8
+                dw btnCancel
+                db 0
+
+
+  sAtrMulti:    db '$'
+                db 'Set'
+                db 8
+                dw sAttribut
+                db 's','$'
+                db 'of '
+                db 6, 0CCh                      ; num of files at 0xCC
+                db ' files','$'
+                db 8
+                dw sAtrBtn
+                db 0
+
+
+  sAtrInfo:     db '$'
+                db 'Setting'
+                db 8
+                dw sAttribut
+                db 's','$'
+                db 8
+                dw btnScrFN                     ; A:filename.ext
+                db 0
+
+    sAttribut:  db ' attribute',0
+
+;-----------------------------------------------------------------------------
+; выбор диска
+;-----------------------------------------------------------------------------
+  sDskChange:   db 5, 'Drive'           ; название окна
+
+  ; запрос на выбор диска
+  MenuDskChg:   dw sDskChg              ; ptr на содержимое окна
+                db 0B0h
+                dw WndGray
+                db 87h
+                dw sDskChange           ; заголовок окна
+                dw runChange
+
+
+;-----------------------------------------------------------------------------
+; формирует содержимое для диалога выбора диска
+;-----------------------------------------------------------------------------
+init_dskdlg:
+        mvi     C, 'A'
+        lxi     H, sDskChg
+        lda     nDisks
+    @frm_dsk:
+        mov     M, C
+        inx     H
+        mvi     M, '$'
+        inx     H
+        inr     C
+        dcr     A
+        jnz     @frm_dsk
+        mvi     M, 0
+        ret
+
+;  sDskChg:      db 'A','$'
+;                db 'B','$'
+;                db 'C','$'
+;                db 'D','$'
+;                db 'E','$'
+;                db 'F','$'
+;                db 'G','$'
+;                db 'H','$'
+;                db 'I','$'
+;                db 'J','$'
+;                db 'K','$'
+;                db 'L','$'
+;                db 0
+
+
+;-----------------------------------------------------------------------------
+; выбор юзер-области
+;-----------------------------------------------------------------------------
+  sUsrChange:   db 4, 'User'            ; название окна
+
+  ; запрос на выбор диска
+  MenuUsrChg:   dw sUsrChg              ; ptr на содержимое окна
+                db 0B0h
+                dw WndGray
+                db 86h
+                dw sUsrChange           ; заголовок окна
+                dw runChange
+
+;-----------------------------------------------------------------------------
+; формирует содержимое для диалога выбора user-области
+;-----------------------------------------------------------------------------
+init_userdlg:
+        lxi     B, 0
+        lxi     D, sUsrChg
+    @frm_usr:
+        push    B
+        call    utoa
+        mvi     A, '$'
+        stax    D
+        inx     D
+        pop     B
+        inx     B
+        mov     A, C
+        cpi     16
+        jnz     @frm_usr
+        xra     A
+        stax    D
+        ret
+
+  ; сами сообщения
+;  sUsrChg:      db '0','$'
+;                db '1','$'
+;                db '2','$'
+;                db '3','$'
+;                db '4','$'
+;                db '5','$'
+;                db '6','$'
+;                db '7','$'
+;                db '8','$'
+;                db '9','$'
+;                db '10','$'
+;                db '11','$'
+;                db '12','$'
+;                db '13','$'
+;                db '14','$'
+;                db '15','$'
+;                db 0
+
+
+;-----------------------------------------------------------------------------
+; выбор сортировки
+;-----------------------------------------------------------------------------
+  sSort:        db 4, 'Sort'            ; название окна
+
+  ; запрос на выбор диска
+  MenuSortChg:  dw sSortChg             ; ptr на содержимое окна
+                db 0B0h
+                dw WndGray
+                db 8Dh
+                dw sSort                ; заголовок окна
+                dw runChange
+
+  ; сами сообщения
+  sSortChg:     db 'Name     ','$'
+                db 'Extension','$'
+                db 0
+
+
+
+;-----------------------------------------------------------------------------
+; Help
+;-----------------------------------------------------------------------------
+  sHelp:        db 4, 'Help'            ; название окна
+
+  MenuHelp:     dw sMainHelp            ; ptr на содержимое окна
+                db 0B0h
+                dw WndGray
+                db 30+80h
+                dw sHelp                ; заголовок окна
+                dw doAnyKey
+                ; окно
+
+  ; сами сообщения
+  sMainHelp:    db '$'
+                db 'CP/M File Manager v 1.6','$'
+                db 1,28,19h,'$'
+;                db 'Alf+F1  - Change left drive ','$'
+;                db 'Alf+F2  - Change right drive','$'
+                db 'Tab',1,5,' ','- Switch panels     ','$'
+                db 'Ins',1,5,' ','- (Un)Select file   ','$'
+                db 1,7,19h,' Command line ',1,7,19h,'$'
+                db 'Sel+Enter- Paste file name  ','$'
+                db 'Enter    - Run file',1,9,' ','$'
+                db 1,10,19h,' Viewer ',1,10,19h,'$'
+                db 'Esc',1,6,' ','- Exit',1,13,' ','$'
+                db 'Tab',1,6,' ','- (Un)Wrap mode    ','$'
+                db 'Numpad 7 - Page up',1,10,' ','$'
+                db 'Numpad 9 - Page down',1,8,' ','$'
+                db 'Numpad 1 - Start of line    ','$'
+                db 0
+
+
+
+
+
+END_MNU_DATA:
+MNU_SIZE equ END_MNU_DATA-BEGIN_MNU_DATA   ; 03CCh
+
+

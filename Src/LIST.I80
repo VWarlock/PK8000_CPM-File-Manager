@@ -1,0 +1,985 @@
+lst_InitMem:
+        lxi     H, lst$Buffer
+        shld    lst$FreeMem
+        xchg
+        lxi     B, LST_BUFSIZE/LST$SIZE ; BC - кол. элементов
+
+    @lstinit_loop:
+        lxi     H, LST$SIZE             ; DE - cur elem
+        dad     D                       ; HL - next elem
+        xchg
+        mov     M, E                    ; [cur] = &next
+        inx     H
+        mov     M, D
+        ; DE - next elem
+        dcx     B
+        mov     A, C
+        ora     B
+        jnz     @lstinit_loop
+        ; последний elem->next = NULL
+        mov     M, A
+        dcx     H
+        mov     M, A
+        ret
+
+; возвращает адрес свободной ячейки
+; на выходе:
+;       HL      - адрес свободного блока (если ZF = 0), или NULL (ZF = 1)
+lst_GetMem:
+        lhld    lst$FreeMem
+        mov     A, L
+        ora     H
+        rz
+        push    D
+        mov     E, M
+        inx     H
+        mov     D, M            ; DE - next free elem
+        dcx     H               ; HL - first free elem
+        xchg
+        shld    lst$FreeMem
+        xchg
+        pop     D
+        ret
+
+; добавляет блок в список свободных
+; на входе:
+;       HL      - адрес елемента
+lst_FreeElem:
+        mov     A, L
+        ora     H
+        rz
+        push    D
+        xchg
+        lhld    lst$FreeMem
+        xchg                    ; DE - first free block / HL - new free block
+        mov     M, E
+        inx     H
+        mov     M, D
+        dcx     H
+        shld    lst$FreeMem
+        pop     D
+        ret
+
+; освобождает целый список
+; на входе:
+;       HL      - список файлов
+lst_FreeList:
+        mov     A, L
+        ora     H
+        rz
+        xchg                    ; DE = t
+        lxi     H, LST$NEXT
+        dad     D
+        mov     A, M
+        inx     H
+        mov     H, M
+        mov     L, A            ; HL = t->next
+        xchg
+        call    lst_FreeElem
+        xchg
+        jmp     lst_FreeList
+
+
+
+;=============================================================================
+;░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+;░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+;░░░░░░░░░░░░░░░░░░░ ПЕРЕМЕЩЕНИЕ КУРСОРА В ОКНЕ ПО СПИСКУ ░░░░░░░░░░░░░░░░░░░░
+;░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+;░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+;=============================================================================
+
+;------------------------------------------------------------------------
+; перемещение курсора в окне вверх на строку
+;------------------------------------------------------------------------
+; на входе:
+;       BC      - Wnd
+;       lst$xxx - текущий список
+lst_CursorUp:
+        call    wndHideCursor
+        call    DoUpCursor
+        cnz     lst_Show
+  @wshowcursor:
+        lda     Lst$PosY
+        mov     E, A
+        jmp     wndShowCursor
+
+
+;------------------------------------------------------------------------
+; перемещение курсора в окне вниз на строку
+;------------------------------------------------------------------------
+; на входе:
+;       BC      - Wnd
+;       lst$xxx - текущий список
+lst_CursorDn:
+        call    wndHideCursor
+        call    DoDnCursor
+        cnz     lst_Show
+        jmp     @wshowcursor
+
+
+;------------------------------------------------------------------------
+; перемещение курсора в окне на страницу вверх
+;------------------------------------------------------------------------
+; на входе:
+;       BC      - Wnd
+;       lst$xxx - текущий список
+lst_CursorPageUp:
+        call    wndHideCursor
+        lda     lst$Height
+        dcr     A
+;        call    wndGetHeight
+;        sui     3
+    @wpguplp:
+        push    PSW
+        call    DoUpCursor
+        cnz     lst_Show
+        pop     PSW
+        dcr     A
+        jnz     @wpguplp
+        jmp     @wshowcursor
+
+
+;------------------------------------------------------------------------
+; перемещение курсора в окне на страницу вниз
+;------------------------------------------------------------------------
+; на входе:
+;       BC      - Wnd
+;       lst$xxx - текущий список
+lst_CursorPageDn:
+        call    wndHideCursor
+        lda     lst$Height
+        dcr     A
+;        call    wndGetHeight
+;        sui     3
+    @wpgdnlp:
+        push    PSW
+        call    DoDnCursor
+        cnz     lst_Show
+        pop     PSW
+        dcr     A
+        jnz     @wpgdnlp
+        jmp     @wshowcursor
+
+
+
+
+;------------------------------------------------------------------------
+; перемещение курсора вверх
+;------------------------------------------------------------------------
+; на выходе:
+;       ZF      - 0: требуется полная перерисовка, 1: не требуется
+; save: BC
+DoUpCursor:
+        lhld    lst$Top
+        xchg                    ; DE = lst->Top
+        call    lst_GetCur      ; HL = lst->Cursor
+        rz                      ; if (!lst->Cursor) return 0
+        lda     lst$PosY        ; A = pos
+        ora     A
+        jz      @upcur_movlst
+        ; простое перемещение в пределах экрана
+        dcr     A
+        sta     lst$PosY        ; pos--
+        lxi     D, LST$PREV
+        dad     D
+        mov     A, M            ; lst->Cursor = lst->Cursor->prev
+        inx     H
+        mov     H, M
+        mov     L, A
+        shld    lst$Cursor
+        xra     A
+        ret
+    @upcur_movlst:
+        ; придется сдвигать экран
+        lxi     H, LST$PREV
+        dad     D
+        mov     A, M
+        inx     H
+        mov     H, M
+        mov     L, A
+        ora     H
+        rz                      ; -> некуда сдвигать
+        shld    lst$Top
+        shld    lst$Cursor
+        ret
+
+
+
+
+;------------------------------------------------------------------------
+; перемещение курсора вниз
+;------------------------------------------------------------------------
+DoDnCursor:
+        call    lst_GetCur      ; HL = lst->Cursor
+        rz
+        lxi     D, LST$NEXT
+        dad     D
+        mov     A, M
+        inx     H
+        mov     H, M
+        mov     L, A            ; cur = cur->next
+        ora     H               ; if (!cur->next)
+        rz                      ;     return 0
+        shld    lst$Cursor      ; lst->Cursor = lst->Cursor.next
+        lda     lst$Height
+        mov     E, A            ; E = lst->max
+        lda     lst$PosY
+        inr     A
+        cmp     E
+        jnc     @dncur_movlst
+        ; просто перемещаем в пределах окна
+        sta     lst$PosY
+        xra     A
+        ret                     ; return 0
+    @dncur_movlst:
+        ; pos >= lst$Height()-2
+        lhld    lst$Top
+        lxi     D, LST$NEXT
+        dad     D
+        mov     A, M
+        inx     H
+        mov     H, M
+        mov     L, A
+        shld    lst$Top         ; lst->Top = lst->Top.next
+        ori     -1
+        ret                     ; return -1
+
+
+
+
+
+
+;=============================================================================
+;░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+;░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+;░░░░░░░░░░░░░░░░░░░ СОЗДАНИЕ И ОТОБРАЖЕНИЕ СПИСКА В ОКНЕ ░░░░░░░░░░░░░░░░░░░░
+;░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+;░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+;=============================================================================
+
+;------------------------------------------------------------------------
+; возвращает указатель на запись под курсором
+;------------------------------------------------------------------------
+; на выходе:
+;       HL      - указатель на запись, или NULL, если список пуст
+;       ZF      - 1: список пуст
+;                 0: в HL указатель на запись под курсором
+lst_GetCur:
+        lhld    lst$Cursor
+        mov     A, L
+        ora     H
+        ret
+
+;------------------------------------------------------------------------
+; проверяет текущий список на наличие записей
+;------------------------------------------------------------------------
+; на выходе:
+;       HL      - начало списка (если ZF = 0), или NULL (если ZF = 1)
+;       ZF      - 1: список пуст
+;                 0: есть записи
+lst_IsEmpty:
+        lhld    lst$First
+lst_retHL:
+        mov     A, L
+        ora     H
+        ret
+
+
+;------------------------------------------------------------------------
+; проверяет текущий список на наличие выделенных записей
+;------------------------------------------------------------------------
+; на выходе:
+;       ZF      - 1: список пуст
+;                 0: есть записи
+;       HL      - количество выделенных записей
+lst_IsSelected:
+        lhld    lst$Selected
+        mov     A, L
+        ora     H
+        ret
+
+
+;------------------------------------------------------------------------
+; выделение файла под курсором
+;------------------------------------------------------------------------
+; на входе:
+;       BC      - окно
+;       Lst$..  - текущий список
+lst_Select:
+        call    lst_GetCur      ; HL - указатель на запись, или NULL, если список пуст
+        rz
+        lxi     D, -1
+        mvi     A, ' '
+        cmp     M
+        jnz     @@lst_mark
+        ; помечаем файл
+        mvi     A, CHR_SELECT   ; '√'
+        inx     D
+        inx     D
+    @@lst_mark:
+        mov     M, A
+        lhld    lst$Selected
+        dad     D
+        shld    lst$Selected
+        ; перерисовываем метку выделения файла
+        push    PSW
+        call    wndHideCursor   ; скрываем курсор
+        lda     lst$PosY
+        mov     E, A            ; E - Lst$Cursor
+        mvi     D, 0
+        call    wndGetOffs      ; HL - vid mem
+        pop     PSW
+        mov     M, A
+        ; показываем курсор
+        jmp     @wshowcursor
+
+;------------------------------------------------------------------------
+; установка атрибутов файла
+;------------------------------------------------------------------------
+; на входе:
+;       HL      - указатель на запись
+;        A      - новые атрибуты
+; save: BC, DE
+lst_SetAttrib:
+        push    B
+        lxi     B, 9
+        dad     B
+        mvi     M, ' '
+        ani     FATTR_SD_BIT
+        jz      @lst_setatr
+        mvi     M, CHR_SYSFILE  ; атрибут системного файла
+    @lst_setatr:
+        pop     B
+        ret
+
+
+;------------------------------------------------------------------------
+; пересчитывает размер текущего диска
+;------------------------------------------------------------------------
+; на выходе:
+;       Lst$DskFree - новый размер диска
+lst_SetDiskFree:
+        call    dsk_GetFree
+        shld    lst$DskFree
+        ret
+
+
+;------------------------------------------------------------------------
+; выводит информацию в нижней части панели
+;------------------------------------------------------------------------
+; на входе:
+;       BC      - окно
+;       Lst$Selected - количество выделенных файлов в панели
+lst_ShowInfo:
+        call    wndGetSplit
+        push    H
+        call    wndGetWidth
+        push    PSW
+        call    lst_IsSelected
+        lxi     D, lst$Status
+        jz      @lst_infosize
+        ; выводим информацию о выделенных файлах
+        push    H
+        lxi     H, sMarked
+        mvi     C, 9
+        call    memcpy
+        pop     B
+        call    utoa
+        jmp     @lst_putinfo
+
+    @lst_infosize:
+        ; выводим информацию о размере дисковой памяти
+        lhld    lst$DskFree
+        mov     C, L
+        mov     B, H
+        mvi     A, ' '
+        stax    D
+        inx     D
+        call    utoa
+        lxi     H, sDskFree
+        mvi     C, 7
+        call    memcpy
+
+        ; собственно выводим на экран строку состояния окна
+    @lst_putinfo:
+        pop     B              ; B - max. len
+        pop     H              ; HL - vid. mem
+        lxi     D, lst$Status
+    @lst_pinflp:
+        ldax    D
+        ora     A
+        jz      @lst_pinfspc
+        inx     D
+        mov     M, A
+        inx     H
+        dcr     B
+        rz
+        jmp     @lst_pinflp
+    @lst_pinfspc:
+        ; B - остаток строки
+        ; HL - vid mem
+        mvi     M, ' '
+        inx     H
+        dcr     B
+        jnz     @lst_pinfspc
+        ret
+
+  sDskFree:     db 'K free',0
+  sMarked:      db ' Marked: '
+
+
+
+;------------------------------------------------------------------------
+; создание списка файлов в текущем списке и на текущем диске
+;------------------------------------------------------------------------
+; на входе:
+;       shFMask - маска файла в формате CP/M (типа: "????????STC")
+;       Lst$..  - текущий список
+lst_MakeFileList:
+        lhld    lst$First
+        call    lst_FreeList
+        call    lst_Reset
+        lxi     B, shFMask
+        call    file_FindFirst
+    @lstfile:
+        mov     A, H
+        ora     L
+        jz      @lstmk_done
+        ; конвертируем имя в формат списка (NC)
+        lxi     D, sBufCnv
+        call    CPM2NC
+        ; добавляем в список
+        lxi     B, sBufCnv
+        call    lst_Insert
+        ; ищем следующий файл
+        call    file_FindNext
+        jmp     @lstfile
+    @lstmk_done:
+        lhld    lst$First
+        jmp     @lst_savtc
+
+  shFMask:      db '???????????'        ; маска поиска файлов для панелей
+
+
+
+;------------------------------------------------------------------------
+; инициализация списка
+;------------------------------------------------------------------------
+; на входе:
+;       BC      - адрес структуры списка (lst$xxxx)
+lst_Init:
+        call    lst_Activate
+        xra     A
+        sta     lst$Sort        ; сортировка по имени файла
+;------------------------------------------------------------------------
+; "сброс" активного списка
+;------------------------------------------------------------------------
+lst_Reset:
+        lxi     H, 0
+        shld    lst$First       ; lst$First = NULL
+        shld    lst$Selected    ; lst$Selected = 0
+    @lst_savtc:
+        shld    lst$Top         ; lst$Top = NULL
+        shld    lst$Cursor      ; lst$Cursor = NULL
+        xra     A
+        sta     lst$PosY        ; lst$PosY = 0
+        ret
+
+
+;------------------------------------------------------------------------
+; делает список активным
+;------------------------------------------------------------------------
+; на входе:
+;       BC      - адрес структуры списка
+; destroy: A, BC
+lst_Activate:
+        push    H
+        push    D
+        push    B
+        push    B
+        lhld    lst$Ptr
+        mov     A, L
+        ora     H
+        jz      @lstact
+        ; сохраняем данные в пред. активный список
+        xchg                    ; DE - теперь уже пред. список
+        lxi     H, lst$First
+        mvi     C, Lst$SizeOf
+        call    memcpy
+    @lstact:
+        ; назначаем новый активный
+        pop     H
+        shld    lst$Ptr
+        lxi     D, lst$First
+        mvi     C, Lst$SizeOf
+        call    memcpy
+        pop     B
+        pop     D
+        pop     H
+        ret
+
+;------------------------------------------------------------------------
+; выводит текущий список в окно
+;------------------------------------------------------------------------
+; на входе:
+;       BC      - окно
+;       Lst$..  - текущий список
+lst_Show:
+        push    B
+        call    wndGetClient
+        lda     lst$Height
+;        call    wndGetHeight
+;        sui     2
+        mov     B, A            ; B - height window
+        xchg                    ; DE - window client address
+        lhld    Lst$Top
+    @shwlist:
+        ; выводим
+        push    D
+        mvi     C, 14
+        ; проверяем на предмет конца списка
+        mov     A, L
+        ora     H
+        jz      @shwclear
+    @shwfile:
+        ; копируем запись на экран
+        mov     A, M
+        stax    D
+        inx     H
+        inx     D
+        dcr     C
+        jnz     @shwfile
+        ; на след. запись
+        inx     H
+        inx     H               ; skip [HL].Prev
+        mov     A, M
+        inx     H
+        mov     H, M
+        mov     L ,A            ; HL = [HL].Next
+        jmp     @shwnext
+    @shwclear:
+        mvi     A, ' '
+    @shwclrlp:
+        stax    D
+        inx     D
+        dcr     C
+        jnz     @shwclrlp
+    @shwnext:
+        pop     D
+        ; достигли конца окна?
+        dcr     B
+        jz      @shwdone
+        ; переходим на след. запись
+        lda     SCRFUL
+        add     E
+        mov     E, A
+        mov     A, D
+        aci     0
+        mov     D, A            ; DE += Screen width
+        jmp     @shwlist
+    @shwdone:
+        pop     B
+        ret
+
+
+
+;------------------------------------------------------------------------
+; поиск записи в списке
+;------------------------------------------------------------------------
+; на входе:
+;       BC      - строка (длиной LST$RECLEN)
+; на выходе:
+;       HL      - адрес элемента (ZF = 0), или NULL (ZF = 1)
+lst_Searsh:
+        call    lst_IsEmpty     ; HL - first element
+        rz                      ; -> список пуст
+    @lstsh_loop:
+        call    lst_namecmp
+        jz      lst_retHL       ; -> нашли совпадение
+        ; переходим к следующей записи
+        lxi     D, LST$NEXT
+        dad     D
+        mov     A, M
+        inx     H
+        mov     H, M
+        mov     L, A
+        ora     H
+        rz                      ; -> достигли конца списка, ничего не нашли
+        jmp     @lstsh_loop
+
+
+; compare datas element [BC] & [HL]
+; на выходе:
+;            | C Z
+;    --------+----
+;    BC = HL | 0 1
+;    BC > HL | 0 0
+;    BC < HL | 1 0
+lst_namecmp:
+        push    H
+        push    B
+        push    D
+        mov     E, C
+        mov     D, B
+        ; пропускаем ведущие пробелы (и символы выделения)
+        inx     H
+        inx     D
+        lda     lst$Sort
+        ora     A
+        jnz     @lst_sortext
+        ; сортируем по имени
+        mvi     C, 8
+        call    memcmp
+        jnz     @lst_nmdone
+        ; пропускаем символ системного файла
+        inx     H
+        inx     D
+        mvi     C, 3
+        call    memcmp
+    @lst_nmdone:
+        pop     D
+        pop     B
+        pop     H
+        ret
+
+    @lst_sortext:
+        ; сортируем по расширению
+        lxi     B, 9
+        dad     B
+        xchg
+        dad     B
+        xchg
+        mvi     C, 3
+        call    memcmp
+        jnz     @lst_nmdone
+        lxi     B, -12
+        dad     B
+        xchg
+        dad     B
+        xchg
+        mvi     C, 8
+        call    memcmp
+        jmp     @lst_nmdone
+
+
+;------------------------------------------------------------------------
+; вставка в список
+;------------------------------------------------------------------------
+; на входе:
+;       BC      - содержимое для нового элемента (длиной LST$RECLEN)
+lst_Insert:
+        ; проверяем наличие места в буфере
+        call    lst_GetMem
+        rz
+        ; создаем новый элемент
+        push    H
+        xchg
+        mov     L, C
+        mov     H, B
+        mvi     C, LST$DATA
+        call    memcpy
+        xchg
+        xra     A
+        mvi     C, 4
+        call    memset
+        call    lst_IsEmpty     ; HL = lst
+        jnz     @lstins_dofind
+        ; это первая запись
+        pop     H
+        shld    lst$Top
+        shld    lst$Cursor
+        shld    lst$First
+        ret
+    @lstins_dofind:
+        pop     B               ; BC = t
+        ; ищем подходящую позицию
+        xchg
+        lxi     H, LST$PREV
+        dad     D
+        mov     A, M
+        inx     H
+        mov     H, M
+        mov     L, A
+        xchg                 ; next = lst
+                             ; prev = lst->prev
+    @lstins_while:
+        mov     A, L
+        ora     H            ; while (next)
+        jz      @lstins_endw
+        call    lst_namecmp
+        jc      @lstins_endw
+        xchg                 ; prev = next
+        lxi     H, LST$NEXT
+        dad     D
+        mov     A, M
+        inx     H
+        mov     H, M
+        mov     L, A
+        jmp     @lstins_while
+    @lstins_endw:
+        push    B
+        push    H
+        mov     L, C
+        mov     H, B
+        lxi     B, LST$PREV
+        dad     B
+        DEtoM                 ; t->prev = prev;
+        pop     B
+        BCtoM                 ; t->next = next;
+        mov     L, C
+        mov     H, B          ; HL = next
+        pop     B             ; BC = t
+        mov     A, E          ; if (!prev)
+        ora     D
+        jnz     @lstins_isend
+        ; вставляем в начало списка
+        lxi     D, LST$PREV
+        dad     D
+        BCtoM                 ; next->prev = t;
+        mov     E, C
+        mov     D, B
+        lhld    lst$First
+        xchg                  ; DE = old lst
+        shld    lst$First     ; lst = t;
+        ; корректируем по необходимости Top
+        lhld    lst$Top
+        call    ucomp
+        jnz     @lstins_done
+        mov     L, C
+        mov     H, B
+        shld    lst$Top         ; Top = t
+        jmp     @lstins_done
+    @lstins_isend:
+        ;в конец или середину списка
+        push    H
+        lxi     H, LST$NEXT
+        dad     D
+        BCtoM                   ; prev->next = t;
+        pop     D               ; DE = next
+        mov     A, E
+        ora     D
+        jz      @lstins_done
+        ; в середину списка
+        lxi     H, LST$PREV
+        dad     D
+        BCtoM                   ; next->prev = t;
+    @lstins_done:
+        push    B
+        pop     H
+        call    lst_Position
+        rc
+        lda     lst$Height
+        mov     E, A
+        lda     lst$PosY
+        inr     A
+        sta     lst$PosY
+        cmp     E
+        cnc     DoUpCursor
+        ret
+
+
+
+
+;------------------------------------------------------------------------
+; возвращает относительную позицию элемента
+;------------------------------------------------------------------------
+; на входе:
+;       HL      - адрес элемента списка
+; на выходе:
+;       ZF      - 1: элемент вне диапазона [Top..Cursor]
+;        A      - bit: 0 - это Top
+;                      1 - это Cursor
+; save: BC, DE
+lst_Position:
+        push    B
+        push    D
+
+        mov     C, L
+        mov     B, H
+        mvi     E, 0            ; E - flags
+        lhld    lst$Top
+        call    lst_namecmp
+        jc      @lstsc_false    ; -> elem < top
+        jnz     @lstpos_chkcur
+        inr     E               ; set bit 0
+    @lstpos_chkcur:
+        push    B
+        lhld    lst$Cursor
+        xthl                    ; HL - elem
+        pop     B               ; BC - cursor
+        call    lst_namecmp
+        jc      @lstsc_false    ; -> elem > cursor
+        jnz     @lstsc_found
+        inr     E               ; set bit 1
+        inr     E
+    @lstsc_found:
+        mov     A, E
+        ora     A               ; CF = 0
+    @lstsc_false:
+        pop     D
+        pop     B
+        ret                     ; return CF=1
+
+
+;------------------------------------------------------------------------
+; удаление текущего элемента из списка
+;------------------------------------------------------------------------
+lst_RemoveCur:
+        call    lst_GetCur
+        rz
+;------------------------------------------------------------------------
+; удаление элемента из списка
+;------------------------------------------------------------------------
+; на входе:
+;       HL      - адрес удаляемого элемента списка
+lst_Remove:
+        push    H
+        push    H
+        lxi     B, LST$PREV
+        dad     B
+        mov     C, M
+        inx     H
+        mov     B, M            ; BC = prev
+        inx     H
+        mov     E, M
+        inx     H
+        mov     D, M            ; DE = next
+        pop     H               ; HL = removed element
+        call    lst_Position
+        jc      @lstrm_done     ; -> вне диапазона [lst$Top..lst$Cursor]
+        push    PSW
+        ani     1
+        jz      @lstrm_cursor
+
+    @lstrm_top:
+        ; удаляется верхний элемент экрана
+        mov     L, C
+        mov     H, B
+        mov     A, E
+        ora     D
+        jz      @lstrm_settop
+        mov     L, E
+        mov     H, D
+      @lstrm_settop:
+        shld    lst$Top
+
+    @lstrm_cursor:
+        pop     PSW
+        ani     2
+        jz      @lstrm_decy
+        mov     A, E
+        ora     D
+        jz      @lstrm_curprev
+        ; cursor = next
+        xchg
+        shld    lst$Cursor
+        xchg
+        jmp     @lstrm_done
+      @lstrm_curprev:
+        ; cursor = prev
+        mov     L, C
+        mov     H, B
+        shld    lst$Cursor
+
+      @lstrm_decy:
+        lda     lst$PosY
+        ora     A
+        jz      @lstrm_done
+        dcr     A
+        sta     lst$PosY
+
+    @lstrm_done:
+        ; "изымаем" элемент
+        ; BC - prev
+        ; DE - next
+        mov     A, E
+        ora     D
+        jz      @lstrm_isprev
+        ; next->prev = prev
+        lxi     H, LST$PREV
+        dad     D
+        mov     M, C
+        inx     H
+        mov     M, B
+      @lstrm_isprev:
+        mov     A, C
+        ora     B
+        jz      @lstrm_first
+        ; prev->next = next
+        lxi     H, LST$NEXT
+        dad     B
+        mov     M, E
+        inx     H
+        mov     M, D
+        jmp     @lstrm_exit
+      @lstrm_first:
+        xchg
+        shld    lst$First
+      @lstrm_exit:
+        pop     H
+        call    lst_FreeElem    ; помечаем элемент свободным
+        ret
+
+
+
+;------------------------------------------------------------------------
+; инициализация перебора выделенных файлов
+;------------------------------------------------------------------------
+lst_BeginEnumSel:
+        lhld    lst$First
+        shld    lst$CurSel
+        shld    lst$NextSel
+        ret
+
+;------------------------------------------------------------------------
+; возвращает очередной выделенный файл
+;------------------------------------------------------------------------
+; на выходе:
+;       sOpFile - имя очередного файла (в формате CP/M: 'A:FILENAMEEXT')
+;       FC      - 0: нет выделенных файлов
+lst_EnumSel:
+        call    lst_IsSelected
+        rz
+        lhld    lst$NextSel
+    @lstnxsel_loop:
+        mov     A, L
+        ora     H
+        jz      lst_EnumSetSel
+        mov     A, M
+        cpi     ' '
+        jnz     @lstnxsel_found
+        lxi     D, LST$NEXT
+        dad     D
+        mov     E, M
+        inx     H
+        mov     D, M
+        xchg                    ; HL = [HL].next
+        jmp     @lstnxsel_loop
+
+
+    @lstnxsel_found:
+        ; нашли выделенный файл
+        mvi     M, ' '
+        shld    Lst$CurSel
+        call    dlg_MakeOpParam
+        lhld    Lst$CurSel
+        lxi     D, LST$NEXT
+        dad     D
+        mov     E, M
+        inx     H
+        mov     D, M
+        xchg                    ; HL = [HL].next
+        shld    lst$NextSel
+        call    lst_EnumDec
+        stc
+        ret
+
+lst_EnumDec:
+        call    lst_IsSelected
+        rz
+        dcx     H
+lst_EnumSetSel:
+        shld    Lst$Selected
+        ret
+

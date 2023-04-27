@@ -1,0 +1,601 @@
+;------------------------------------------------------------------------
+; просмотр файла
+;------------------------------------------------------------------------
+; на входе:
+;       5Ch     - FCB открытого файла
+;       viewSize- размер файла
+runView:
+        call    kbFlush
+        ; задаем размер буфера
+        lhld    viFileSize
+        lxi     D, IO_BUF_SIZE/128
+        call    ucomp
+        jnc     @vi_setbsize
+        xchg
+    @vi_setbsize:
+        shld    viBufSize
+        ; и его конец
+        mvi     C, 7
+        call    shl16           ; HL - размер буфера в байтах
+        lxi     B, viBuffer
+        dad     B
+        dcx     H
+        shld    viBufEnd        ; viBufEnd = &viBuffer + (viBufSize << 7) - 1;
+
+        ; остальное
+        mov     L, C
+        mov     H, B            ; HL = &viBuffer
+        shld    viBufPos        ; viBufPos = &viBuffer
+        lxi     H, 0
+        shld    viFilePos       ; viFilePos = 0
+        shld    viXDelta        ; viXDelta = 0
+
+        ; подгружаем файл в буфер
+;        lxi     B, viBuffer
+;        lxi     D, 0
+        xchg                    ; DE = 0
+        lhld    viBufSize
+        call    mRead
+        call    vi_redraw
+
+
+        ; просматриваем
+    @vi_getkey:
+        ei
+        call    kbGetKey
+
+        cpi     1Fh
+        jz      @vi_cdown       ; -> курсор вниз
+        cpi     1Eh
+        jz      @vi_cup         ; -> курсор вверх
+        cpi     1Dh
+        jz      @vi_cleft       ; -> курсор влево
+        cpi     1Ch
+        jz      @vi_cright      ; -> курсор вправо
+        cpi     19h
+        jz      @vi_cpgdn       ; -> на страницу вниз
+        cpi     0Bh
+        jz      @vi_cpgup       ; -> на страницу вверх
+        cpi     09h
+        jz      @vi_swwrap      ; -> переключаем режим Wrap
+        cpi     02h
+        jz      @vi_home        ; -> в начало строки
+        cpi     1Bh
+        jnz     @vi_getkey
+
+        ret
+
+@vi_swwrap:
+        lda     viWrap
+        xri     1
+        sta     viWrap
+        call    vi_redraw
+        jmp     @vi_getkey
+
+@vi_home:
+        lda     viXDelta
+        ora     A
+        jz      @vi_getkey
+        xra     A
+        sta     viXDelta
+        call    vi_redraw
+        jmp     @vi_getkey
+
+@vi_cdown:
+        call    viIsBufEnd
+        jc      @vi_getkey
+        lhld    viBufPos
+        call    viScanFw
+        jc      @vi_getkey
+        shld    viBufPos
+        call    vi_redraw
+        jmp     @vi_getkey
+
+
+@vi_cpgdn:
+        call    viIsBufEnd
+        jc      @vi_getkey
+        mvi     B, 23
+    @vi_cdnlp:
+        push    B
+        lhld    viPosEnd
+        call    viScanFw
+        jc      @vi_cdnsw
+        shld    viPosEnd
+        lhld    viBufPos
+        call    viScanFw
+        shld    viBufPos
+        pop     B
+        dcr     B
+        jnz     @vi_cdnlp
+        push    B
+    @vi_cdnsw:
+        pop     B
+        call    vi_redraw
+        jmp     @vi_getkey
+
+
+@vi_cup:
+        call    viIsBufBegin
+        jc      @vi_getkey
+        call    viScanRw
+        jc      @vi_getkey
+        call    vi_redraw
+        jmp     @vi_getkey
+
+@vi_cpgup:
+        call    viIsBufBegin
+        jc      @vi_getkey
+        mvi     B, 23
+    @vi_cuplp:
+        push    B
+        call    viScanRw
+        pop     B
+        jc      @vi_cupsw
+        dcr     B
+        jnz     @vi_cuplp
+    @vi_cupsw:
+        call    vi_redraw
+        jmp     @vi_getkey
+
+
+@vi_cleft:
+        lda     viXDelta
+        ora     A
+        jz      @vi_getkey
+        dcr     A
+        sta     viXDelta
+        call    vi_redraw
+        jmp     @vi_getkey
+
+@vi_cright:
+        lda     viWrap
+        ora     A
+        jnz     @vi_getkey
+        lda     viXDelta
+        cpi     127
+        jz      @vi_getkey
+        inr     A
+        sta     viXDelta
+        call    vi_redraw
+        jmp     @vi_getkey
+
+
+
+;------------------------------------------------------------------------
+; проверка на достижение начала буфера
+;------------------------------------------------------------------------
+; на выходе:
+;       CF      - 1: достигли начала буфера
+;                 0: нет ещё
+viIsBufBegin:
+        lxi     D, viBuffer
+        lhld    viBufPos
+        call    ucomp
+        cmc
+        ret
+;------------------------------------------------------------------------
+; проверка на достижение конца буфера
+;------------------------------------------------------------------------
+; на выходе:
+;       CF      - 1: достигли конца буфера
+;                 0: нет ещё
+viIsBufEnd:
+        lhld    viPosEnd
+        xchg
+        lhld    viBufEnd
+        call    ucomp
+        cmc
+        ret
+
+
+vi_redraw:
+        mvi     B, 24
+        lhld    viBufPos
+        xchg
+        lhld    BUFSCR
+    @viewshow:
+        push    B
+        call    viPutStr
+        pop     B
+        dcr     B
+        jnz     @viewshow
+        xchg
+        shld    viPosEnd
+        ret
+
+
+
+;------------------------------------------------------------------------
+; вывод строки на экран
+;------------------------------------------------------------------------
+; на входе:
+;       DE      - строка
+;       HL      - видеопамять
+viPutStr:
+        call    viMaxLen        ; C - макс. длина строки
+        mvi     B, 0            ; B - текущая координата по X
+        jc      @vi_psspace
+        ; C     - макс. остаток строки
+        ; DE    - строка
+        ; HL    - видеопамять
+        lda     viXDelta
+        ora     A
+        jz      @vi_psshowstr
+        ; -----------------------------
+        ; пропускаем левую часть строки
+        ; -----------------------------
+        push    H
+        mov     L, A            ; L - XDelta
+        mvi     H, 0            ; H - X
+    @vi_xdelta:
+        ldax    D
+        inx     D
+        cpi     0Dh
+        jz      @vi_psxis0A
+        cpi     0Ah
+        jz      @vi_psxend
+        cpi     9
+        jz      @vi_psxdotab
+        inr     H
+    @vi_xnext:
+        dcr     C
+        jz      @vi_psxend
+        dcr     L
+        jnz     @vi_xdelta
+    @vi_psxdone:
+        ; прошли всю XDelta, строка еще не кончилась
+        pop     H
+        jmp     @vi_psshowstr
+    @vi_psxdotab:
+        inr     H
+        mov     A, H
+        ani     7
+        jz      @vi_xnext
+        dcr     L
+        jnz     @vi_psxdotab
+        ; табуляция вышла за XDelta, запоняем начало экрана пробелами
+        ; вычисляем сколько нужно пробелов
+        mov     A, H
+        adi     8
+        ani     7
+        cma
+        inr     A
+        adi     8               ; A = 8 - ( (X+8) & 7 )
+        pop     H
+    @vi_psxfill:
+        mvi     M, ' '
+        inx     H
+        inr     B
+        dcr     A
+        jnz     @vi_psxfill
+        jmp     @vi_psshowstr
+
+    @vi_psxis0A:
+        pop     H
+        jmp     @vi_psis0A
+    @vi_psxend:
+        ; строка закончилась не достигнув XDelta
+        pop     H
+        jmp     @vi_psspace     ; -> добиваем остаток экрана пробелами
+
+
+        ; -----------------------
+        ; выводим строку на экран
+        ; -----------------------
+    @vi_psshowstr:
+        ; C     - макс. остаток строки [1..255]
+        ; B     - текущая координата по X
+        ; DE    - строка
+        ; HL    - видеопамять
+    @vi_psloop:
+        ldax    D
+        inx     D               ; DE - след. символ
+        cpi     0Dh             ; DOS (0x0D, 0x0A)?
+        jz      @vi_psis0A
+        jnc     @vi_psputc
+        cpi     0Ah             ; UNIX (0x0A)?
+        jz      @vi_psspace     ; -> добиваем остаток экрана пробелами
+        cpi     9
+        jnz     @vi_psputc
+    @vi_pstab:
+        mvi     M, ' '
+        inx     H
+        inr     B
+        mov     A, B
+        cpi     40
+        jz      @vi_psskps   ; -> пропускаем остаток строки
+        lda     viXDelta
+        add     B
+        ani     7
+        jnz     @vi_pstab
+        jmp     @vi_psnextch
+    @vi_psputc:
+        mov     M, A
+        inx     H
+        inr     B
+        mov     A, B
+        cpi     40
+        jz      @vi_psskps   ; -> пропускаем остаток строки
+    @vi_psnextch:
+        dcr     C
+        jnz     @vi_psloop
+
+; достигли конца строки, заполняем остаток экрана пробелами
+; на входе:
+;       B       - текущая координата по X
+;       HL      - указатель на видеопамять
+    @vi_psspace:
+        mvi     A, 40
+        sub     B
+        jz      @vi_psdone
+    @vi_psspcloop:
+        mvi     M, ' '
+        inx     H
+        dcr     A
+        jnz     @vi_psspcloop
+; завершаем работу
+    @vi_psdone:
+        lxi     B, 64-40
+        dad     B               ; HL - next video line
+        ret
+
+; встретился символ 0x0D, ожидаем символа 0x0A
+; на входе:
+;       C       - макс. остаток строки
+;       DE      - указатель на текущий символ
+    @vi_psis0A:
+        call    @vi_readb       ; читаем очередной байт из буфера
+        jc      @vi_psspace     ; -> достигли конца буфера
+        cpi     0Ah
+        jnz     @vi_psspace
+        inx     D
+        jmp     @vi_psspace
+
+
+; достигли конца экрана, пропускаем остаток строки до следующей
+; на входе:
+;       C       - макс. остаток строки
+;       DE      - указатель на текущий символ
+    @vi_psskps:
+        lda     viWrap
+        ora     A
+        jnz     @vi_psdone
+    @vi_psskipstr:
+        dcr     C
+        jz      @vi_psdone
+        ldax    D
+        inx     D
+        cpi     0Dh
+        jz      @vi_psis0A
+        cpi     0Ah
+        jz      @vi_psdone
+        jmp     @vi_psskipstr
+
+
+
+
+;------------------------------------------------------------------------
+; чтение байта из буфера с проверкой на выход за его конец
+;------------------------------------------------------------------------
+; на входе:
+;       DE      - указатель на текущий символ
+; на выходе:
+;       A       - считанный символ
+;       CF      - 1: достигли конца буфера (символ недействите
+;                 0: все ок
+@vi_readb:
+        lda     viBufEnd+1
+        cmp     D               ;
+        jc      @vi_rdbyte      ; -> HI(viBufEnd) < HI(cur)
+        jnz     @vi_rdbyte      ; -> HI(viBufEnd) > HI(cur)
+        ; HI(viBufEnd) == HI(cur)
+        lda     viBufEnd
+        cmp     E               ; cmp  LO(viBufEnd) , LO(cur)
+    @vi_rdbyte:
+        ldax    D
+        ret
+
+;------------------------------------------------------------------------
+; чтение байта из буфера с проверкой выхода за начало буфера
+;------------------------------------------------------------------------
+; на входе:
+;       HL      - текущая позиция в буфере
+; на выходе:
+;       A       - считанный символ
+;       CF      - 1: вышли за начало буфера
+;                 0: в буфере или его начале
+;       ZF      - 1: начало буфера
+@vi_readbr:
+        lxi     D, viBuffer
+        mov     A, H
+        cmp     D              ;
+        jc      @vi_rdrend     ; -> HI(cur) < HI(viBuffer)
+        jnz     @vi_rdrend     ; -> HI(cur) > HI(viBuffer)
+        ; HI(cur) == HI(viBuffer)
+        mov     A, L
+        cmp     E              ; LO(cur)   LO(viBuffer)
+    @vi_rdrend:
+        mov     A, M
+        ret
+
+;------------------------------------------------------------------------
+; сканирование буфера вперед в поисках конца строки
+;------------------------------------------------------------------------
+; на входе:
+;       HL      - текущая позиция в буфере
+;       viBufEnd- конец буфера
+; на выходе:
+;       CF      - 1: выход за пределы буфера
+viScanFw:
+        xchg
+        call    viMaxLen        ; C - макс. длина строки
+        rc
+
+    @vi_sfwloop:
+        ldax    D
+        inx     D
+        cpi     0Dh             ; DOS (0x0D, 0x0A)?
+        jz      @vi_sfw0D
+        cpi     0Ah             ; UNIX (0x0A)?
+        jz      @vi_sfwEnd
+        ; это обычный символ
+        dcr     C
+        jnz     @vi_sfwloop
+        ; превысили лимит длины строки
+
+    @vi_sfwEnd:
+        xchg
+        xra     A
+        ret                     ; clear CF
+
+    @vi_sfw0D:
+        ; проверяем выход за пределы буффера
+        lhld    viBufEnd
+        call    ucomp
+        jz      @vi_sfwD0A
+        cmc
+        rc
+    @vi_sfwD0A:
+        ldax    D
+        cpi     0Ah
+        jnz     @vi_sfwEnd
+        inx     D
+        jmp     @vi_sfwEnd
+
+
+;------------------------------------------------------------------------
+; сканирование буфера назад в поисках начала новой строки
+;------------------------------------------------------------------------
+; на входе:
+;       viBufPos- текущая позиция в буфере
+; на выходе:
+;       viBufPos- новое начало строки в буфере
+viScanRw:
+        lhld    viBufPos
+        dcx     H
+        ; пропускаем конец пред. строки
+        call    @vi_readbr
+        rc
+        cpi     0Ah
+        jnz     @vi_scnrdo
+        dcx     H
+        call    @vi_readbr
+        jc      @vi_scanrfound
+        cpi     0Dh
+        jnz     @vi_scnrdo
+        dcx     H
+    @vi_scnrdo:
+        call    viMaxRLen       ; C - max len string
+        jc      @vi_scanrfound  ; HL - cur pos
+    @vi_scnrloop:
+        ; ищем начало строки
+        mov     A, M
+        cpi     0Dh
+        jz      @vi_scanrfound
+        cpi     0Ah
+        jz      @vi_scanrfound
+        dcx     H
+        dcr     C
+        jnz     @vi_scnrloop
+    @vi_scanrfound:
+        inx     H
+        shld    viBufPos
+        ora     A
+        ret
+
+;------------------------------------------------------------------------
+; возвращает максимально возможную длину строки в сторону начала буфера
+;------------------------------------------------------------------------
+; на входе:
+;       HL      - текущая позиция в буфере
+;       viBuffer- начало буфера
+; на выходе:
+;       C       - длина строки
+;       CF      - 1: выход за пределы буфера, результат недействителен
+viMaxRLen:
+        lxi     D, viBuffer
+        push    H
+        jmp     @vi_MaxLen
+
+; возвращает максимально возможную длину строки
+; на входе:
+;       DE      - начало строки в буфере
+; на выходе:
+;       C       - длина строки
+;       CF      - 1: конец буфера, результат недействителен
+;
+viMaxLen:
+        push    H
+        lhld    viBufEnd
+    @vi_MaxLen:
+        call    sub16           ; HL = viBufEnd - addrString
+        jc      @vi_mxlEnd
+        inx     H
+        ; ограничиваем длину строки 255 символами
+        mov     A, H
+        ora     A
+        jz      @vi_mxlWarp     ; -> HL <= 255
+        mvi     L, 255
+    @vi_mxlWarp:
+        lda     viWrap
+        ora     A
+        jz      @vi_mxlDone
+        ; ограничиваем шириной экрана
+        mov     A, L
+        cpi     40
+        jc      @vi_mxlDone     ; -> строка короче ширины экрана
+        mvi     L, 40
+    @vi_mxlDone:
+        mov     C, L
+        xra     A               ; clear CF
+    @vi_mxlEnd:
+        pop     H
+        ret
+
+
+
+
+
+
+
+
+
+
+; на входе:
+;       BC      - адрес буфера для чтения
+;       DE      - нач. сектор
+;       HL      - кол. секторов
+;       DEF_FCB - FCB открытого файла
+mRead:
+        call    dsk_SetDMA
+    @mread_loop:
+        mov     A, L
+        ora     H
+        rz
+        ; задаем буфер для чтения
+;        push    B               ; save BC
+;        call    dsk_SetDMA
+        ; читаем сектор
+        lxi     B, DEF_FCB
+        call    file_ReadRec
+        rnz
+;        pop     B
+;        mov     A, C            ; BC += 128
+;        adi     128
+;        mov     C, A
+;        mov     A, B
+;        aci     0
+;        mov     B, A
+        call    dsk_IncDMA
+
+        inx     D
+        dcx     H
+        mov     A, L
+        ora     H
+        jnz     @mread_loop
+        ret
+
+
+
+
